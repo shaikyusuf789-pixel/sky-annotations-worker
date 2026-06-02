@@ -193,7 +193,7 @@ def _update_clip_status(script_id: str, chunk_id: str, slide_source: str,
 # HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
-WORKER_VERSION = "2026-06-02.render-fix-004"
+WORKER_VERSION = "2026-06-02.ffmpeg-debug-005"
 
 @app.get("/health")
 def health():
