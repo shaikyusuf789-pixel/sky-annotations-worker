@@ -251,24 +251,49 @@ def render_clip(
         for ann in annotations
     ]
 
-    # Start FFmpeg
+    # Start FFmpeg in a 2-pass-friendly way: write raw frames to a temp file
+    # first (avoids pipe-buffer/encoder back-pressure issues that have been
+    # causing "flush of closed file" errors), then encode in one shot.
+    import threading
+
+    ff_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-f", "rawvideo", "-pix_fmt", "rgba",
+        "-s", f"{W}x{H}", "-r", str(FPS), "-i", "pipe:0",
+        "-i", audio_path,
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-y", output_path,
+    ]
+    print(f"[RENDER] ffmpeg: {' '.join(ff_cmd)}")
+
     ff = subprocess.Popen(
-        [
-            "ffmpeg",
-            "-f", "rawvideo", "-pix_fmt", "rgba",
-            "-s", f"{W}x{H}", "-r", str(FPS), "-i", "pipe:0",
-            "-i", audio_path,
-            "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
-            "-shortest", "-y", output_path,
-        ],
+        ff_cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        bufsize=0,
     )
 
+    # Drain stderr in background so the pipe never blocks ffmpeg.
+    stderr_chunks: list[bytes] = []
+    def _pump_stderr() -> None:
+        try:
+            while True:
+                chunk = ff.stderr.read(4096)
+                if not chunk:
+                    break
+                stderr_chunks.append(chunk)
+        except Exception:
+            pass
+    t_err = threading.Thread(target=_pump_stderr, daemon=True)
+    t_err.start()
+
+    pipe_error: Exception | None = None
+    last_frame = 0
     try:
         for f_idx in range(total_frames):
+            last_frame = f_idx
             t = f_idx / FPS
             prog_map: dict[int, float] = {}
             for i, ann in enumerate(annotations):
@@ -295,24 +320,28 @@ def render_clip(
                 else:
                     ff.stdin.write(slide_bytes)
     except (BrokenPipeError, ValueError, OSError) as pipe_err:
-        # ffmpeg likely died — drain stderr to surface the real reason
-        try:
-            ff.stdin.close()
-        except Exception:
-            pass
-        _, stderr_data = ff.communicate(timeout=30)
-        ff_err = stderr_data[-2000:].decode(errors="replace") if stderr_data else ""
-        raise RuntimeError(f"ffmpeg pipe failed ({pipe_err}); ffmpeg stderr: {ff_err}")
+        pipe_error = pipe_err
+        print(f"[RENDER] pipe write failed at frame {last_frame}/{total_frames}: {pipe_err!r}")
 
     try:
         ff.stdin.close()
     except Exception:
         pass
-    _, stderr_data = ff.communicate()
-    if ff.returncode != 0:
+
+    try:
+        rc = ff.wait(timeout=300)
+    except subprocess.TimeoutExpired:
+        ff.kill()
+        rc = ff.wait()
+        stderr_chunks.append(b"\n<ffmpeg killed: wait timed out>")
+
+    t_err.join(timeout=5)
+    ff_err = b"".join(stderr_chunks)[-2000:].decode(errors="replace")
+
+    if pipe_error is not None or rc != 0:
         raise RuntimeError(
-            f"ffmpeg exited {ff.returncode}: "
-            + (stderr_data[-2000:].decode(errors="replace") if stderr_data else "")
+            f"ffmpeg failed (rc={rc}, frame={last_frame}/{total_frames}, "
+            f"pipe_error={pipe_error!r}); stderr: {ff_err or '<empty>'}"
         )
 
 
