@@ -380,6 +380,18 @@ def render_clip(
 
     pipe_error: Exception | None = None
     last_frame = 0
+    # Cache composited frame bytes keyed by a quantized progress signature.
+    # Most frames are either "no annotations active" or "all active annotations
+    # fully drawn" — both produce identical pixels for long stretches. Caching
+    # avoids re-rasterizing SVG + alpha_composite every frame, which was the
+    # source of OOM-kill (rc=-9, BrokenPipe) on Railway.
+    frame_cache: dict[tuple, bytes] = {}
+    MAX_CACHE = 48
+
+    def _sig(pm: dict[int, float]) -> tuple:
+        # Quantize to 2% steps so near-identical progress reuses cache
+        return tuple(sorted((i, round(p * 50) / 50) for i, p in pm.items()))
+
     try:
         for f_idx in range(total_frames):
             last_frame = f_idx
@@ -395,22 +407,35 @@ def render_clip(
                 elapsed = t - start
                 prog_map[i] = 1.0 if elapsed >= dur else _eased(elapsed / dur)
 
-
             if not prog_map:
                 ff.stdin.write(slide_bytes)
+                continue
+
+            key = _sig(prog_map)
+            cached = frame_cache.get(key)
+            if cached is not None:
+                ff.stdin.write(cached)
+                continue
+
+            svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h, pen)
+            if not svg:
+                frame_bytes = slide_bytes
             else:
-                svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h, pen)
-                if svg:
-                    png_bytes = cairosvg.svg2png(
-                        bytestring=svg.encode(),
-                        output_width=W,
-                        output_height=H,
-                    )
-                    overlay = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-                    frame   = Image.alpha_composite(slide_rgba, overlay)
-                    ff.stdin.write(frame.tobytes())
-                else:
-                    ff.stdin.write(slide_bytes)
+                png_bytes = cairosvg.svg2png(
+                    bytestring=svg.encode(),
+                    output_width=W,
+                    output_height=H,
+                )
+                overlay = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+                frame = Image.alpha_composite(slide_rgba, overlay)
+                frame_bytes = frame.tobytes()
+                overlay.close()
+                frame.close()
+                del overlay, frame, png_bytes
+
+            if len(frame_cache) < MAX_CACHE:
+                frame_cache[key] = frame_bytes
+            ff.stdin.write(frame_bytes)
     except (BrokenPipeError, ValueError, OSError) as pipe_err:
         pipe_error = pipe_err
         print(f"[RENDER] pipe write failed at frame {last_frame}/{total_frames}: {pipe_err!r}")
