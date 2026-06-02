@@ -32,14 +32,29 @@ def download_to_tmp(bucket: str, path: str, suffix: str = "") -> str:
     url = _public_url(bucket, path)
     print(f"[STORAGE] download {bucket}/{path}")
     r = httpx.get(url, follow_redirects=True, timeout=120)
-    if r.status_code == 404:
-        raise FileNotFoundError(f"Storage file not found: {bucket}/{path}")
+    if r.status_code in (400, 404):
+        raise FileNotFoundError(f"Storage file not found: {bucket}/{path} (status {r.status_code})")
     r.raise_for_status()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(r.content)
     tmp.flush()
     tmp.close()
     return tmp.name
+
+
+def download_slide_to_tmp(script_id: str, chunk_number: int, suffix: str = ".png") -> str:
+    """
+    Download a slide image, trying both 0- and 1-indexed naming conventions.
+    """
+    last_err: Exception | None = None
+    for candidate in (chunk_number, chunk_number + 1):
+        path = f"{script_id}/slide_{candidate:03d}.png"
+        try:
+            return download_to_tmp(SLIDES_BUCKET, path, suffix)
+        except FileNotFoundError as e:
+            last_err = e
+            continue
+    raise last_err or FileNotFoundError(f"No slide for {script_id}/chunk {chunk_number}")
 
 
 def slide_path(script_id: str, chunk_number: int) -> str:
