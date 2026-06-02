@@ -2,9 +2,9 @@
 lib/storage.py — Supabase Storage helpers for download and upload.
 
 Bucket layout (all public):
-  slides      → {script_id}/slide_{NNN}.png          (chunk_number zero-padded to 3 digits)
-  audio-files → {script_id}/audio_{N}.mp3
-  video-clips → {script_id}/clip_{NNN}_{slide_source}.mp4
+  slides      → {script_id}/slide_{NNN}.png          (chunk_number zero-padded to 3 digits, 1-indexed)
+  audio-files → {script_id}/audio_{NNN}.mp3          (chunk_number zero-padded to 3 digits, 1-indexed)
+  video-clips → {script_id}/clip_{NNN}_{slide_source}.mp4   (chunk_number zero-padded to 3 digits, 1-indexed)
 """
 
 import os
@@ -42,31 +42,29 @@ def download_to_tmp(bucket: str, path: str, suffix: str = "") -> str:
     return tmp.name
 
 
+def _one_indexed(chunk_number: int) -> int:
+    """All on-disk asset names are 1-indexed, 3-digit padded.
+    chunk_number arriving from DB is the 0-based chunk_index, so we add 1."""
+    return chunk_number + 1
+
+
 def download_slide_to_tmp(script_id: str, chunk_number: int, suffix: str = ".png") -> str:
-    """
-    Download a slide image, trying both 0- and 1-indexed naming conventions.
-    """
-    last_err: Exception | None = None
-    for candidate in (chunk_number, chunk_number + 1):
-        path = f"{script_id}/slide_{candidate:03d}.png"
-        try:
-            return download_to_tmp(SLIDES_BUCKET, path, suffix)
-        except FileNotFoundError as e:
-            last_err = e
-            continue
-    raise last_err or FileNotFoundError(f"No slide for {script_id}/chunk {chunk_number}")
+    """Download slide image using uniform 1-indexed 3-digit padded naming."""
+    path = slide_path(script_id, chunk_number)
+    return download_to_tmp(SLIDES_BUCKET, path, suffix)
 
 
 def slide_path(script_id: str, chunk_number: int) -> str:
-    return f"{script_id}/slide_{chunk_number:03d}.png"
+    return f"{script_id}/slide_{_one_indexed(chunk_number):03d}.png"
 
 
 def audio_path(script_id: str, chunk_number: int) -> str:
-    return f"{script_id}/audio_{chunk_number}.mp3"
+    return f"{script_id}/audio_{_one_indexed(chunk_number):03d}.mp3"
 
 
 def clip_storage_path(script_id: str, chunk_number: int, slide_source: str) -> str:
-    return f"{script_id}/clip_{chunk_number:03d}_{slide_source}.mp4"
+    return f"{script_id}/clip_{_one_indexed(chunk_number):03d}_{slide_source}.mp4"
+
 
 
 def upload_clip(local_path: str, storage_path: str) -> str:
