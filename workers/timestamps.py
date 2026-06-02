@@ -21,8 +21,8 @@ Coverage repair:
   the word list with the synthetic timings ONLY if they cover more of the
   audio than the original.
 
-Returns: (phrases, duration)
-  phrases = [{ "word": str, "original": str, "start": float, "end": float }, ...]
+Returns: (words, duration)
+  words = [{ "word": str, "original": str, "start": float, "end": float }, ...]
 """
 
 from openai import OpenAI
@@ -80,6 +80,44 @@ def _extract_words(raw_words) -> list[dict]:
             "start":    round(float(w.start if hasattr(w, "start") else w.get("start", 0)), 3),
             "end":      round(float(w.end   if hasattr(w, "end")   else w.get("end",   0)), 3),
         })
+    return out
+
+
+def _split_multiword_entries(entries: list[dict]) -> list[dict]:
+    """OpenAI can return phrase-sized timestamp entries for Telugu audio.
+    Split any multi-word entry into true per-word timings so downstream
+    annotation matching has one timestamp per spoken token.
+    """
+    out: list[dict] = []
+    for idx, entry in enumerate(entries):
+        text = str(entry.get("word") or "").strip()
+        original = str(entry.get("original") or text).strip()
+        toks = [t for t in text.split() if t]
+        orig_toks = [t for t in original.split() if t]
+        if not toks:
+            continue
+
+        s = float(entry.get("start", 0.0) or 0.0)
+        e = float(entry.get("end", 0.0) or 0.0)
+        if e <= s:
+            next_start = None
+            for nxt in entries[idx + 1:]:
+                ns = float(nxt.get("start", 0.0) or 0.0)
+                if ns > s:
+                    next_start = ns
+                    break
+            e = next_start if next_start and next_start > s else s + max(0.25, 0.32 * len(toks))
+
+        step = max(0.08, (e - s) / len(toks))
+        for i, tok in enumerate(toks):
+            ws = s + i * step
+            we = min(e, ws + step)
+            out.append({
+                "word":     tok,
+                "original": orig_toks[i] if i < len(orig_toks) else tok,
+                "start":    round(ws, 3),
+                "end":      round(max(we, ws + 0.08), 3),
+            })
     return out
 
 
@@ -197,7 +235,7 @@ def get_timestamps(audio_path: str) -> tuple[list[dict], float]:
     else:
         duration = 0.0
 
-    words = _extract_words(raw_words)
+    words = _split_multiword_entries(_extract_words(raw_words))
     cov = _coverage(words, duration)
     print(f"[TS] primary word coverage = {cov*100:.1f}% ({len(words)} words / {duration:.2f}s)")
 
@@ -209,6 +247,5 @@ def get_timestamps(audio_path: str) -> tuple[list[dict], float]:
             print(f"[TS] using synthesized timings (better coverage)")
             words = synth
 
-    phrases = _group_into_phrases(words)
-    print(f"[TS] {len(words)} words → {len(phrases)} phrases, duration={duration:.2f}s")
-    return phrases, duration
+    print(f"[TS] returning {len(words)} word-level timestamps, duration={duration:.2f}s")
+    return words, duration
