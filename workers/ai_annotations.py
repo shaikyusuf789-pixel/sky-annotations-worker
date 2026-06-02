@@ -166,29 +166,42 @@ def generate_annotations(
 {_ocr_lines(ocr_words)}
 
 === TASK ===
-1. Look at the slide image — note the heading, bullets, layout.
+1. Look at the slide image carefully. Identify EVERY visually emphasised
+   piece of text — bold words, ALL-CAPS labels, numbers, names, coloured
+   pills, callout chips, icons-with-labels. THESE are your prime circle
+   targets. A real tutor circles bold/highlighted keywords first.
 2. Read the script and identify EVERY meaningful concept the narrator says
-   (key terms, numbers, names, definitions, phrases). Aim for one annotation
-   roughly every 3–5 seconds of audio, distributed across the WHOLE chunk
-   (NOT clustered at the end).
+   (key terms, numbers, names, definitions, phrases). Aim for one
+   annotation roughly every 2–4 seconds, spread across the WHOLE chunk
+   (NOT clustered at the end, NOT clustered at the start).
 3. For each concept, find the matching word/phrase/line on the slide
    (semantic match — slide wording is paraphrased from the script).
-4. STRONGLY PREFER short keyword targets: single words, numbers, names, or
-   2–4 word phrases. CIRCLE them when possible — like a tutor circling a
-   key term ("Focus", "Facts", "20", "Kohli"). Full-line underlines are
-   visually heavy; cap them at MAX 2 per chunk, and only use them when the
-   narrator literally summarises the whole bullet.
-5. start_time = the timestamp of the FIRST word the narrator says that
+4. CIRCLE STRATEGY — this is the most important rule:
+   • Default to `circle` for any bold word, number, name, or 1–3 word
+     phrase the narrator mentions ("Focus", "Facts", "20", "Kohli",
+     "smart study", "2-3 questions", "frequently asked").
+   • Prefer the BOLD/highlighted sub-phrase INSIDE a bullet over the
+     whole bullet line. e.g. if the bullet says "Smart aspirants can
+     expect **2–3 direct questions** from sports events", circle
+     "2–3 direct questions" — NOT the whole bullet.
+   • Every chunk MUST have at least 4–6 circles on tight keywords.
+5. UNDERLINE STRATEGY:
+   • Use short `underline` (2–5 words) only when no good circle target
+     exists for a concept.
+   • Max 2 full-line underlines per chunk. Never underline more than
+     half the bullets on a slide.
+6. start_time = the timestamp of the FIRST word the narrator says that
    maps to this concept. Use the transliterated timestamps as ground truth.
-6. target_text MUST be the EXACT OCR text (copy character-for-character).
+7. target_text MUST be the EXACT OCR text (copy character-for-character).
    For multi-word targets, concatenate consecutive OCR words with single
    spaces in the order they appear in the OCR dump.
-7. Vary types. double_underline at most ONCE (the heading). Lean heavily
-   on `circle` for keywords. Mix in short `underline`, occasional `box`
-   or `arrow` so it feels like a real tutor.
-8. Return 15–25 annotations, chronologically ordered, spread across the
-   full duration. NEVER cluster more than 3 annotations in the same 2-second
-   window.
+8. Vary types. double_underline at most ONCE (the heading). Lean heavily
+   on `circle` for bold keywords. Mix in short `underline`, occasional
+   `box` or `arrow` so it feels like a real tutor.
+9. Return 15–25 annotations, chronologically ordered, spread across the
+   full duration. NEVER cluster more than 3 annotations in the same
+   2-second window. If the slide is sparse, still try to hit 12+ by
+   re-spotlighting key terms when the narrator references them again.
 
 Return ONLY the JSON object."""
 
