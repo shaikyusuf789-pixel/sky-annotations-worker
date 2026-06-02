@@ -156,20 +156,29 @@ def generate_annotations(
 {_ocr_lines(ocr_words)}
 
 === TASK ===
-1. Look at the slide image carefully — note the heading, bullets, layout.
-2. Read the script and identify every meaningful concept the narrator says.
-3. For EACH concept, find the matching word/phrase/line on the slide
-   (semantic match, not keyword match — slide wording is paraphrased).
-4. Decide whether to annotate a single word, a phrase, or a whole line
-   based on what makes sense visually.
-5. Compute start_time by aligning the concept to the spoken word(s) in
-   the timestamps.
-6. Use bbox EXACTLY from the OCR list (for multi-word phrases, compute the
-   bounding rectangle covering all the OCR words in the phrase).
-7. Vary annotation types. Use double_underline at most ONCE (the heading).
-8. Return 12–25 annotations, chronologically ordered.
+1. Look at the slide image — note the heading, bullets, layout.
+2. Read the script and identify EVERY meaningful concept the narrator says
+   (key terms, numbers, names, definitions, phrases). Aim for one annotation
+   roughly every 3–5 seconds of audio, distributed across the WHOLE chunk
+   (NOT clustered at the end).
+3. For each concept, find the matching word/phrase/line on the slide
+   (semantic match — slide wording is paraphrased from the script).
+4. PREFER short targets: single keywords, numbers, names, or 2–4 word phrases.
+   Only annotate a full bullet line when the narrator clearly summarises
+   that whole point.
+5. start_time = the timestamp of the FIRST word the narrator says that
+   maps to this concept. Use the transliterated timestamps as ground truth.
+6. target_text MUST be the EXACT OCR text (copy character-for-character).
+   For multi-word targets, concatenate consecutive OCR words with single
+   spaces in the order they appear in the OCR dump.
+7. Vary types. double_underline at most ONCE (the heading). Mix underline,
+   circle, box, arrow so it feels like a real tutor.
+8. Return 15–25 annotations, chronologically ordered, spread across the
+   full duration. NEVER cluster more than 3 annotations in the same 2-second
+   window.
 
 Return ONLY the JSON object."""
+
 
     user_content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
     if slide_image_url:
@@ -200,28 +209,111 @@ Return ONLY the JSON object."""
     if not isinstance(annotations, list):
         annotations = []
 
-    # Sanitise
+    # Sanitise + RECOMPUTE bbox from OCR (GPT often returns wrong bboxes for
+    # multi-word phrases — it copies the title's bbox or the first OCR bbox).
     allowed_types = {"underline", "double_underline", "circle", "box", "arrow"}
-    clean = []
+    clean: list[dict[str, Any]] = []
     for ann in annotations:
         t = ann.get("type")
         if t not in allowed_types:
             continue
-        bbox = ann.get("bbox")
-        if not isinstance(bbox, list) or len(bbox) != 4:
+        target = str(ann.get("target_text") or "").strip()
+        if not target:
             continue
+
+        located = _locate_phrase_bbox(target, ocr_words)
+        if located is None:
+            bbox = ann.get("bbox")
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            try:
+                located = [int(v) for v in bbox]
+            except (TypeError, ValueError):
+                continue
+
         try:
             clean.append({
                 "type":        t,
                 "start_time":  max(0.0, float(ann.get("start_time") or 0)),
-                "target_text": str(ann.get("target_text") or ""),
-                "bbox":        [int(v) for v in bbox],
+                "target_text": target,
+                "bbox":        located,
             })
         except (TypeError, ValueError):
             continue
 
-    # Sort chronologically
+    # Drop duplicate bboxes (GPT often collapses several phrases onto the same
+    # heading bbox — keep only the first occurrence per bbox).
+    seen: set[tuple[int, int, int, int]] = set()
+    deduped: list[dict[str, Any]] = []
+    for ann in clean:
+        key = tuple(ann["bbox"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ann)
+    clean = deduped
+
     clean.sort(key=lambda a: a["start_time"])
 
     print(f"[AI] {len(clean)} annotations generated for chunk {chunk_number}")
     return clean
+
+
+# ── Phrase → bbox locator ────────────────────────────────────────────────────
+
+_NORM_RE = re.compile(r"[^a-z0-9]+")
+
+def _norm(s: str) -> str:
+    return _NORM_RE.sub("", s.lower())
+
+
+def _locate_phrase_bbox(phrase: str, ocr_words: list[dict]) -> list[int] | None:
+    """
+    Find the contiguous OCR word run whose joined text best matches `phrase`
+    and return the union bbox [x, y, w, h]. Returns None if no decent match.
+    """
+    if not phrase or not ocr_words:
+        return None
+    target = _norm(phrase)
+    if not target:
+        return None
+
+    norm_words = [_norm(w.get("text", "")) for w in ocr_words]
+    n = len(ocr_words)
+    best: tuple[float, int, int] | None = None
+
+    for i in range(n):
+        joined = ""
+        for j in range(i, min(n, i + 40)):
+            joined += norm_words[j]
+            if not joined:
+                continue
+            if target in joined:
+                overshoot = len(joined) - len(target)
+                score = 1.0 - (overshoot / max(len(target), 1)) * 0.2
+                if best is None or score > best[0]:
+                    best = (score, i, j + 1)
+                break
+            if joined in target:
+                cov = len(joined) / len(target)
+                if cov >= 0.6:
+                    score = cov * 0.9
+                    if best is None or score > best[0]:
+                        best = (score, i, j + 1)
+            if len(joined) > len(target) * 2:
+                break
+
+    if best is None:
+        return None
+    _, i, j = best
+
+    xs, ys, x2s, y2s = [], [], [], []
+    for k in range(i, j):
+        w = ocr_words[k]
+        x = int(w.get("x", 0)); y = int(w.get("y", 0))
+        ww = int(w.get("w", 0)); hh = int(w.get("h", 0))
+        xs.append(x); ys.append(y); x2s.append(x + ww); y2s.append(y + hh)
+    if not xs:
+        return None
+    return [min(xs), min(ys), max(x2s) - min(xs), max(y2s) - min(ys)]
+
