@@ -193,7 +193,7 @@ def _update_clip_status(script_id: str, chunk_id: str, slide_source: str,
 # HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
-WORKER_VERSION = "2026-06-02.ai-vision-003"
+WORKER_VERSION = "2026-06-02.render-fix-004"
 
 @app.get("/health")
 def health():
@@ -419,7 +419,10 @@ def _render_job(script_id: str, chunk_id: str, chunk_number: int, slide_source: 
         tmp_slide = download_slide_to_tmp(script_id, chunk_number, ".png")
         tmp_audio = download_to_tmp(AUDIO_BUCKET, _resolve_audio_key(script_id, chunk_id, chunk_number), ".mp3")
 
-        tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir="/tmp/render").name
+        os.makedirs("/tmp/render", exist_ok=True)
+        _fd, tmp_out = tempfile.mkstemp(suffix=".mp4", dir="/tmp/render")
+        os.close(_fd)
+
         annotations = json.loads(ai_row["annotations"])
 
         duration = render_clip(tmp_slide, tmp_audio, annotations, tmp_out)
