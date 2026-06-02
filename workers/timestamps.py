@@ -1,16 +1,28 @@
 """
-workers/timestamps.py — OpenAI Whisper word-level timestamps.
+workers/timestamps.py — OpenAI word-level timestamps for Telugu+English audio.
 
-Strategy for Indian-language audio (Telugu / Hindi / etc.):
-  - Let Whisper auto-detect the spoken language (do NOT force language="en";
-    forcing English produces hallucinated Devanagari output for Telugu audio).
-  - After transcription, transliterate each word to Latin script using
-    Unidecode so downstream AI prompts get a stable romanized form.
-    This is transliteration (script conversion), NOT translation —
-    meaning is preserved, only the script changes.
+Strategy:
+  - Primary model: gpt-4o-transcribe (better word-boundary detection for
+    Indic languages mixed with English than whisper-1).
+  - Fallback model: whisper-1 (only if gpt-4o-transcribe fails).
+  - We FORCE language="en" so Telugu words come back romanized
+    (e.g. "neenu mii mentor") instead of Telugu script. This is critical:
+    downstream AI matching compares spoken words against English slide OCR,
+    so we want phonetic Latin output, not native script.
+  - We pass a domain prompt hinting it's a Telugu educational explainer
+    with English technical terms — this nudges the model to keep proper
+    word boundaries instead of merging multiple Telugu words into one token.
 
-Returns a list of:
-  { "word": str, "start": float, "end": float }
+Coverage repair:
+  After transcription, if word-level coverage spans < 70% of the audio
+  duration (Whisper sometimes collapses 5 Telugu words into 1 entry that
+  spans 11s), we fall back to segment-level data and synthesize per-word
+  timings by evenly splitting each segment across its words. We replace
+  the word list with the synthetic timings ONLY if they cover more of the
+  audio than the original.
+
+Returns: (phrases, duration)
+  phrases = [{ "word": str, "original": str, "start": float, "end": float }, ...]
 """
 
 from openai import OpenAI
@@ -20,18 +32,90 @@ from lib.config import config
 
 _openai = OpenAI(api_key=config.OPENAI_API_KEY)
 
+_TRANSCRIBE_PROMPT = (
+    "This is a Telugu educational explainer video for competitive exam students. "
+    "The narrator speaks Telugu mixed with English technical terms (e.g. 'mentor', "
+    "'science', 'physics', 'chemistry', 'biology', 'SSC', 'CGL', 'exam'). "
+    "Transcribe each Telugu word phonetically in English letters (romanization), "
+    "preserving natural word boundaries. Do not merge multiple words into one token."
+)
+
 
 def _to_latin(text: str) -> str:
-    """Transliterate any script to Latin (ASCII). Keeps ASCII as-is."""
     if not text:
         return ""
-    # Fast path: already ASCII
     try:
         text.encode("ascii")
         return text
     except UnicodeEncodeError:
         pass
     return unidecode(text).strip()
+
+
+def _transcribe(audio_path: str, model: str) -> object:
+    print(f"[TS] trying model={model}")
+    with open(audio_path, "rb") as f:
+        return _openai.audio.transcriptions.create(
+            file=f,
+            model=model,
+            language="en",  # force romanized Latin output for Telugu
+            prompt=_TRANSCRIBE_PROMPT,
+            response_format="verbose_json",
+            timestamp_granularities=["word", "segment"],
+        )
+
+
+def _extract_words(raw_words) -> list[dict]:
+    out: list[dict] = []
+    for w in raw_words or []:
+        original = (w.word if hasattr(w, "word") else w.get("word", "")).strip()
+        if not original:
+            continue
+        latin = _to_latin(original)
+        if not latin:
+            continue
+        out.append({
+            "word":     latin,
+            "original": original,
+            "start":    round(float(w.start if hasattr(w, "start") else w.get("start", 0)), 3),
+            "end":      round(float(w.end   if hasattr(w, "end")   else w.get("end",   0)), 3),
+        })
+    return out
+
+
+def _coverage(words: list[dict], duration: float) -> float:
+    if not words or duration <= 0:
+        return 0.0
+    span = words[-1]["end"] - words[0]["start"]
+    return max(0.0, min(1.0, span / duration))
+
+
+def _synthesize_from_segments(raw_segments, duration: float) -> list[dict]:
+    """Evenly split each segment's time window across its words."""
+    out: list[dict] = []
+    for seg in raw_segments or []:
+        text = (seg.text if hasattr(seg, "text") else seg.get("text", "")) or ""
+        s = float(seg.start if hasattr(seg, "start") else seg.get("start", 0))
+        e = float(seg.end   if hasattr(seg, "end")   else seg.get("end",   0))
+        if e <= s:
+            continue
+        toks = [t for t in text.strip().split() if t]
+        if not toks:
+            continue
+        step = (e - s) / len(toks)
+        for i, tok in enumerate(toks):
+            ws = s + i * step
+            we = ws + step
+            latin = _to_latin(tok)
+            if not latin:
+                continue
+            out.append({
+                "word":     latin,
+                "original": tok,
+                "start":    round(ws, 3),
+                "end":      round(we, 3),
+            })
+    return out
 
 
 def _group_into_phrases(
@@ -41,12 +125,6 @@ def _group_into_phrases(
     max_words: int = 6,
     pause_break: float = 0.35,
 ) -> list[dict]:
-    """Group micro word-timings into moderate phrase chunks (1.5–4s, ~3-6 words).
-
-    Breaks on: punctuation-ending word, long inter-word pause (>pause_break),
-    max word count, or max duration reached. Gives the AI better semantic
-    anchors than raw word-by-word stamps.
-    """
     if not words:
         return []
     phrases: list[dict] = []
@@ -91,55 +169,46 @@ def _group_into_phrases(
 
 
 def get_timestamps(audio_path: str) -> tuple[list[dict], float]:
-    """
-    Transcribe an MP3 with Whisper and return phrase-level timestamps
-    (moderate 1.5–4s chunks, ~3-6 words each), with each phrase
-    transliterated to Latin script. This gives downstream AI better
-    semantic anchors than raw word-by-word timings.
-    """
-    print(f"[TS] transcribing {audio_path} (Telugu prompt hint, transliterate to Latin)")
+    print(f"[TS] transcribing {audio_path} (language=en forced, romanized)")
 
-    with open(audio_path, "rb") as f:
-        transcription = _openai.audio.transcriptions.create(
-            file=f,
-            model="whisper-1",
-            # Telugu isn't in whisper-1's enforced language list, but a Telugu
-            # prompt strongly biases auto-detect toward Telugu (was mis-picking
-            # Tamil/Hindi on some chunks → garbage transliteration + few words).
-            prompt="ఇది తెలుగు ఆడియో. SSC, APPSC, బ్యాంకింగ్ ఎగ్జామ్స్ కి సంబంధించిన IPL కరెంట్ అఫైర్స్ లెక్చర్.",
-            response_format="verbose_json",
-            timestamp_granularities=["word"],
-        )
+    transcription = None
+    last_err: Exception | None = None
+    for model in ("gpt-4o-transcribe", "whisper-1"):
+        try:
+            transcription = _transcribe(audio_path, model)
+            print(f"[TS] success with model={model}")
+            break
+        except Exception as exc:
+            last_err = exc
+            print(f"[TS] model={model} failed: {exc!r}")
+            transcription = None
+    if transcription is None:
+        raise RuntimeError(f"all transcription models failed: {last_err!r}")
 
     raw_words    = getattr(transcription, "words",    None) or []
     raw_segments = getattr(transcription, "segments", None) or []
 
-    words: list[dict] = []
-    for w in raw_words:
-        original = (w.word if hasattr(w, "word") else w.get("word", "")).strip()
-        if not original:
-            continue
-        latin = _to_latin(original)
-        if not latin:
-            continue
-        words.append({
-            "word":     latin,
-            "original": original,
-            "start":    round(float(w.start if hasattr(w, "start") else w.get("start", 0)), 3),
-            "end":      round(float(w.end   if hasattr(w, "end")   else w.get("end",   0)), 3),
-        })
-
-    # Group micro word-stamps into phrase chunks for the AI / annotation layer
-    phrases = _group_into_phrases(words)
-
     if raw_segments:
         last = raw_segments[-1]
         duration = float(last.end if hasattr(last, "end") else last.get("end", 0))
-    elif words:
-        duration = words[-1]["end"]
+    elif raw_words:
+        lw = raw_words[-1]
+        duration = float(lw.end if hasattr(lw, "end") else lw.get("end", 0))
     else:
         duration = 0.0
 
-    detected = getattr(transcription, "language", None)
-    print(f"[TS] detected={detected!r}, {len(words)} words → {len(phrases)} phrases, duration={duration:.2f}s")
+    words = _extract_words(raw_words)
+    cov = _coverage(words, duration)
+    print(f"[TS] primary word coverage = {cov*100:.1f}% ({len(words)} words / {duration:.2f}s)")
+
+    if cov < 0.70 and raw_segments:
+        synth = _synthesize_from_segments(raw_segments, duration)
+        synth_cov = _coverage(synth, duration)
+        print(f"[TS] synthesized from segments: coverage = {synth_cov*100:.1f}% ({len(synth)} words)")
+        if synth_cov > cov and synth:
+            print(f"[TS] using synthesized timings (better coverage)")
+            words = synth
+
+    phrases = _group_into_phrases(words)
+    print(f"[TS] {len(words)} words → {len(phrases)} phrases, duration={duration:.2f}s")
     return phrases, duration
