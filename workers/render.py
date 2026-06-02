@@ -16,6 +16,7 @@ Annotation colors:
 
 import io
 import math
+import random
 import subprocess
 import tempfile
 import os
@@ -26,21 +27,23 @@ from PIL import Image
 
 W, H, FPS = 1920, 1080, 30
 
+# Warmer "marker" palette — feels more like a tutor's highlighter than a UI accent
 STROKE_COLORS = {
-    "underline":         "#3b82f6",
-    "double_underline":  "#0ea5e9",
-    "circle":            "#f59e0b",
-    "box":               "#10b981",
-    "arrow":             "#8b5cf6",
+    "underline":         "#ffd54a",  # marker yellow
+    "double_underline":  "#ff7043",  # orange-red (heading)
+    "circle":            "#ff5252",  # red ink
+    "box":               "#26c6da",  # cyan ink
+    "arrow":             "#ab47bc",  # purple ink
 }
 
 DRAW_SECONDS = {
-    "underline":         1.2,
-    "double_underline":  1.6,
-    "circle":            1.8,
-    "box":               2.0,
-    "arrow":             1.2,
+    "underline":         0.9,
+    "double_underline":  1.4,
+    "circle":            1.6,
+    "box":               1.8,
+    "arrow":             1.0,
 }
+
 
 
 # ── Coordinate transform (OCR source → 1920×1080) ───────────────────────────
@@ -69,51 +72,99 @@ def _eased(t: float) -> float:
     return t * t * (3 - 2 * t)
 
 
-def _pts_to_path(pts: list[tuple[int, int]]) -> str:
+def _pts_to_path(pts: list[tuple[float, float]]) -> str:
     if not pts:
         return ""
-    d = f"M{pts[0][0]},{pts[0][1]}"
-    for p in pts[1:]:
-        d += f" L{p[0]},{p[1]}"
+    d = f"M{pts[0][0]:.1f},{pts[0][1]:.1f}"
+    # Quadratic-smoothed path so the hand wobble looks like ink, not zig-zags
+    for i in range(1, len(pts)):
+        x, y = pts[i]
+        d += f" L{x:.1f},{y:.1f}"
     return d
 
 
-def _underline_pts(x: int, y_bottom: int, w: int) -> list[tuple[int, int]]:
-    steps = max(20, w // 4)
-    return [(x + w * i // steps, y_bottom + 4) for i in range(steps + 1)]
+def _rng(seed_key: str) -> random.Random:
+    return random.Random(hash(seed_key) & 0xFFFFFFFF)
 
 
-def _double_underline_pts(x: int, y_bottom: int, w: int) -> list[list[tuple[int, int]]]:
-    steps = max(20, w // 4)
-    line1 = [(x + w * i // steps, y_bottom + 4) for i in range(steps + 1)]
-    line2 = [(x + w * i // steps, y_bottom + 11) for i in range(steps + 1)]
+def _underline_pts(x: int, y_bottom: int, w: int, seed: str = "u") -> list[tuple[float, float]]:
+    """Wavy, slightly sloped underline — looks like a tutor's marker stroke."""
+    r = _rng(seed)
+    steps = max(40, w // 6)
+    # Random tiny slope and vertical offset
+    slope = r.uniform(-0.012, 0.012)
+    base_y = y_bottom + r.uniform(3, 8)
+    amp = r.uniform(1.6, 3.2)
+    freq = r.uniform(0.018, 0.035)
+    phase = r.uniform(0, math.tau)
+    pts: list[tuple[float, float]] = []
+    for i in range(steps + 1):
+        px = x + w * i / steps
+        wave = math.sin(phase + (px - x) * freq) * amp
+        jitter = r.uniform(-0.9, 0.9)
+        py = base_y + slope * (px - x) + wave + jitter
+        pts.append((px, py))
+    return pts
+
+
+def _double_underline_pts(x: int, y_bottom: int, w: int, seed: str = "d") -> list[list[tuple[float, float]]]:
+    line1 = _underline_pts(x, y_bottom, w, seed + "1")
+    line2 = _underline_pts(x, y_bottom + 9, w, seed + "2")
     return [line1, line2]
 
 
-def _circle_pts(cx: float, cy: float, rx: float, ry: float) -> list[tuple[int, int]]:
-    return [
-        (
-            round(cx + rx * math.cos(-math.pi / 2 - 2.1 * math.pi * i / 89)),
-            round(cy + ry * math.sin(-math.pi / 2 - 2.1 * math.pi * i / 89)),
-        )
-        for i in range(90)
-    ]
+def _circle_pts(cx: float, cy: float, rx: float, ry: float, seed: str = "c") -> list[tuple[float, float]]:
+    """Hand-drawn loop — slightly overshoots, varies radius."""
+    r = _rng(seed)
+    n = 110
+    start = -math.pi / 2 + r.uniform(-0.2, 0.2)
+    sweep = 2 * math.pi + r.uniform(0.1, 0.45)  # overshoot
+    pts: list[tuple[float, float]] = []
+    for i in range(n + 1):
+        t = i / n
+        a = start - sweep * t
+        # Wobble radius
+        wob = 1 + 0.04 * math.sin(t * 6.0 + r.random() * 2) + r.uniform(-0.015, 0.015)
+        px = cx + rx * wob * math.cos(a)
+        py = cy + ry * wob * math.sin(a)
+        pts.append((px, py))
+    return pts
 
 
-def _box_pts(x: int, y: int, w: int, h: int) -> list[tuple[int, int]]:
-    n = 20
-    def side(x1, y1, x2, y2):
-        return [(x1 + (x2 - x1) * i // n, y1 + (y2 - y1) * i // n) for i in range(n)]
-    return side(x, y, x+w, y) + side(x+w, y, x+w, y+h) + side(x+w, y+h, x, y+h) + side(x, y+h, x, y) + [(x, y)]
+def _box_pts(x: int, y: int, w: int, h: int, seed: str = "b") -> list[tuple[float, float]]:
+    r = _rng(seed)
+    def side(x1, y1, x2, y2, n=24):
+        out = []
+        for i in range(n + 1):
+            t = i / n
+            px = x1 + (x2 - x1) * t + r.uniform(-1.4, 1.4)
+            py = y1 + (y2 - y1) * t + r.uniform(-1.4, 1.4)
+            out.append((px, py))
+        return out
+    # Start a bit before top-left, close a bit past it (sketchy overshoot)
+    sx = x - r.uniform(2, 6); sy = y - r.uniform(2, 6)
+    return (side(sx, sy, x+w, y)
+            + side(x+w, y, x+w, y+h)
+            + side(x+w, y+h, x, y+h)
+            + side(x, y+h, sx, sy))
 
 
-def _arrow_pts(x: int, y_mid: int) -> list[tuple[int, int]]:
-    tip = x - 10
-    return (
-        [(tip - 40 + i * 2, y_mid) for i in range(20)] +
-        [(tip - i * 8, y_mid - i * 8) for i in range(5)] +
-        [(tip - 40 + i * 8, y_mid - 40 + i * 8) for i in range(5)]
-    )
+def _arrow_pts(x: int, y_mid: int, seed: str = "a") -> list[list[tuple[float, float]]]:
+    r = _rng(seed)
+    tip_x = x - 8 + r.uniform(-2, 2)
+    tip_y = y_mid + r.uniform(-3, 3)
+    tail_x = tip_x - 80
+    tail_y = tip_y + r.uniform(-6, 6)
+    shaft = []
+    for i in range(40):
+        t = i / 39
+        px = tail_x + (tip_x - tail_x) * t + r.uniform(-1.0, 1.0)
+        py = tail_y + (tip_y - tail_y) * t + math.sin(t * 4) * 1.2
+        shaft.append((px, py))
+    head1 = [(tip_x, tip_y), (tip_x - 18 + r.uniform(-2,2), tip_y - 12 + r.uniform(-2,2))]
+    head2 = [(tip_x, tip_y), (tip_x - 18 + r.uniform(-2,2), tip_y + 12 + r.uniform(-2,2))]
+    return [shaft, head1, head2]
+
 
 
 # ── Frame SVG builder ────────────────────────────────────────────────────────
@@ -126,62 +177,55 @@ def _build_frame_svg(
 ) -> str:
     paths_svg = []
 
+    def _stroke(d: str, color: str, sw: float, opacity: float = 0.92) -> str:
+        return (
+            f'<path d="{d}" stroke="{color}" stroke-width="{sw:.1f}" '
+            f'fill="none" stroke-linecap="round" stroke-linejoin="round" '
+            f'opacity="{opacity:.2f}"/>'
+        )
+
     for idx, ann in enumerate(annotations):
         prog = progress_map.get(idx)
         if prog is None or prog <= 0:
             continue
 
         ann_type = ann["type"]
-        color    = STROKE_COLORS.get(ann_type, "#ffffff")
-        sw       = "8" if ann_type in ("circle", "box") else "6"
+        color    = STROKE_COLORS.get(ann_type, "#ffd54a")
         x, y, w, h = _scale_bbox(ann["bbox"], src_w, src_h)
+        seed = f"{idx}-{ann.get('target_text','')[:24]}"
 
         if ann_type == "underline":
-            pts  = _underline_pts(x, y + h, w)
-            n    = max(2, round(len(pts) * prog))
-            d    = _pts_to_path(pts[:n])
-            paths_svg.append(
-                f'<path d="{d}" stroke="{color}" stroke-width="{sw}" '
-                f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
-            )
+            pts = _underline_pts(x, y + h, w, seed=seed)
+            n   = max(2, round(len(pts) * prog))
+            # Two slightly offset passes → marker ink texture
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 7.0, 0.85))
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 3.5, 0.55))
 
         elif ann_type == "double_underline":
-            for line_pts in _double_underline_pts(x, y + h, w):
-                n  = max(2, round(len(line_pts) * prog))
-                d  = _pts_to_path(line_pts[:n])
-                paths_svg.append(
-                    f'<path d="{d}" stroke="{color}" stroke-width="6" '
-                    f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
-                )
+            for li, line_pts in enumerate(_double_underline_pts(x, y + h, w, seed=seed)):
+                n = max(2, round(len(line_pts) * prog))
+                paths_svg.append(_stroke(_pts_to_path(line_pts[:n]), color, 6.0, 0.9))
+                paths_svg.append(_stroke(_pts_to_path(line_pts[:n]), color, 2.8, 0.5))
 
         elif ann_type == "circle":
             cx, cy = x + w / 2, y + h / 2
-            rx, ry = w / 2 + 14, h / 2 + 12
-            pts  = _circle_pts(cx, cy, rx, ry)
-            n    = max(2, round(len(pts) * prog))
-            d    = _pts_to_path(pts[:n])
-            paths_svg.append(
-                f'<path d="{d}" stroke="{color}" stroke-width="{sw}" '
-                f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
-            )
+            rx, ry = w / 2 + 18, h / 2 + 14
+            pts = _circle_pts(cx, cy, rx, ry, seed=seed)
+            n   = max(2, round(len(pts) * prog))
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 6.5, 0.9))
 
         elif ann_type == "box":
-            pts = _box_pts(x - 6, y - 4, w + 12, h + 8)
+            pts = _box_pts(x - 8, y - 6, w + 16, h + 12, seed=seed)
             n   = max(2, round(len(pts) * prog))
-            d   = _pts_to_path(pts[:n])
-            paths_svg.append(
-                f'<path d="{d}" stroke="{color}" stroke-width="{sw}" '
-                f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
-            )
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 6.0, 0.9))
 
         elif ann_type == "arrow":
-            pts = _arrow_pts(x, y + h // 2)
-            n   = max(2, round(len(pts) * prog))
-            d   = _pts_to_path(pts[:n])
-            paths_svg.append(
-                f'<path d="{d}" stroke="{color}" stroke-width="{sw}" '
-                f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
-            )
+            shaft, h1, h2 = _arrow_pts(x, y + h // 2, seed=seed)
+            n = max(2, round(len(shaft) * prog))
+            paths_svg.append(_stroke(_pts_to_path(shaft[:n]), color, 6.0, 0.9))
+            if prog > 0.85:
+                paths_svg.append(_stroke(_pts_to_path(h1), color, 6.0, 0.9))
+                paths_svg.append(_stroke(_pts_to_path(h2), color, 6.0, 0.9))
 
     if not paths_svg:
         return ""
@@ -191,6 +235,7 @@ def _build_frame_svg(
         + "".join(paths_svg)
         + "</svg>"
     )
+
 
 
 # ── Audio duration ────────────────────────────────────────────────────────────
