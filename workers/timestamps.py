@@ -97,13 +97,16 @@ def get_timestamps(audio_path: str) -> tuple[list[dict], float]:
     transliterated to Latin script. This gives downstream AI better
     semantic anchors than raw word-by-word timings.
     """
-    print(f"[TS] transcribing {audio_path} (language=te Telugu, transliterate to Latin)")
+    print(f"[TS] transcribing {audio_path} (Telugu prompt hint, transliterate to Latin)")
 
     with open(audio_path, "rb") as f:
         transcription = _openai.audio.transcriptions.create(
             file=f,
             model="whisper-1",
-            language="te",  # Force Telugu — auto-detect occasionally mis-picks Tamil/Hindi
+            # Telugu isn't in whisper-1's enforced language list, but a Telugu
+            # prompt strongly biases auto-detect toward Telugu (was mis-picking
+            # Tamil/Hindi on some chunks → garbage transliteration + few words).
+            prompt="ఇది తెలుగు ఆడియో. SSC, APPSC, బ్యాంకింగ్ ఎగ్జామ్స్ కి సంబంధించిన IPL కరెంట్ అఫైర్స్ లెక్చర్.",
             response_format="verbose_json",
             timestamp_granularities=["word"],
         )
