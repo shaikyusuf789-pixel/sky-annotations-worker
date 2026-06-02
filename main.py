@@ -193,7 +193,7 @@ def _update_clip_status(script_id: str, chunk_id: str, slide_source: str,
 # HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
-WORKER_VERSION = "2026-06-02.force-telugu-asr-011"
+WORKER_VERSION = "2026-06-02.telugu-prompt-hint-012"
 
 @app.get("/health")
 def health():
