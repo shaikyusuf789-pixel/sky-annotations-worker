@@ -29,7 +29,7 @@ W, H, FPS = 1920, 1080, 30
 # Annotations start drawing this many seconds BEFORE the spoken word so the
 # visual lands in sync with the voice (compensates for ElevenLabs alignment
 # bias + human perception lag). Override via env if needed.
-ANNOTATION_LEAD = float(os.environ.get("ANNOTATION_LEAD_SECONDS", "0.6"))
+ANNOTATION_LEAD = float(os.environ.get("ANNOTATION_LEAD_SECONDS", "1.1"))
 
 
 # Single-pen mode: ONE color per clip, chosen from slide background brightness.
@@ -38,11 +38,11 @@ PEN_DARK  = "#111111"   # near-black ink for light slides
 PEN_LIGHT = "#f5f5f5"   # near-white ink for dark slides
 
 DRAW_SECONDS = {
-    "underline":         0.9,
-    "double_underline":  0.9,   # rendered as a single underline now
-    "circle":            1.6,
-    "box":               1.8,
-    "arrow":             1.1,
+    "underline":         0.8,
+    "double_underline":  0.8,
+    "circle":            1.1,
+    "box":               1.2,
+    "arrow":             0.9,
 }
 
 
@@ -129,32 +129,30 @@ def _double_underline_pts(x: int, y_bottom: int, w: int, seed: str = "d") -> lis
 
 
 def _circle_pts(cx: float, cy: float, rx: float, ry: float, seed: str = "c") -> list[tuple[float, float]]:
-    """Hand-drawn loop — irregular radius, slight tilt, noticeable overshoot,
-    and a tiny tail-out so it reads as a tutor's quick pen circle, not a CAD ellipse."""
+    """Hand-drawn loop — neat tutor pen circle: minimal tilt, small overshoot,
+    light wobble, and enough padding so the loop sits OUTSIDE the text."""
     r = _rng(seed)
     n = 130
-    start = -math.pi / 2 + r.uniform(-0.5, 0.5)
-    sweep = 2 * math.pi + r.uniform(0.25, 0.7)   # bigger overshoot
-    tilt  = r.uniform(-0.18, 0.18)               # rotate the whole ellipse a touch
+    start = -math.pi / 2 + r.uniform(-0.25, 0.25)
+    sweep = 2 * math.pi + r.uniform(0.10, 0.25)  # gentle overshoot (~6–14°)
+    tilt  = r.uniform(-0.05, 0.05)               # ~±3° — barely tilted
     cos_t, sin_t = math.cos(tilt), math.sin(tilt)
-    # Per-axis low-frequency wobble + per-point jitter so radius varies all the way around
-    wob_amp_x = r.uniform(0.04, 0.09)
-    wob_amp_y = r.uniform(0.04, 0.09)
-    wob_freq_x = r.uniform(1.5, 3.0)
-    wob_freq_y = r.uniform(1.5, 3.0)
+    wob_amp_x = r.uniform(0.02, 0.04)
+    wob_amp_y = r.uniform(0.02, 0.04)
+    wob_freq_x = r.uniform(1.5, 2.5)
+    wob_freq_y = r.uniform(1.5, 2.5)
     wob_phase_x = r.uniform(0, math.tau)
     wob_phase_y = r.uniform(0, math.tau)
     pts: list[tuple[float, float]] = []
     for i in range(n + 1):
         t = i / n
         a = start - sweep * t
-        wx = 1 + wob_amp_x * math.sin(wob_phase_x + t * math.tau * wob_freq_x) + r.uniform(-0.025, 0.025)
-        wy = 1 + wob_amp_y * math.sin(wob_phase_y + t * math.tau * wob_freq_y) + r.uniform(-0.025, 0.025)
+        wx = 1 + wob_amp_x * math.sin(wob_phase_x + t * math.tau * wob_freq_x) + r.uniform(-0.012, 0.012)
+        wy = 1 + wob_amp_y * math.sin(wob_phase_y + t * math.tau * wob_freq_y) + r.uniform(-0.012, 0.012)
         ex = rx * wx * math.cos(a)
         ey = ry * wy * math.sin(a)
-        # apply tilt
-        px = cx + ex * cos_t - ey * sin_t + r.uniform(-0.8, 0.8)
-        py = cy + ex * sin_t + ey * cos_t + r.uniform(-0.8, 0.8)
+        px = cx + ex * cos_t - ey * sin_t + r.uniform(-0.5, 0.5)
+        py = cy + ex * sin_t + ey * cos_t + r.uniform(-0.5, 0.5)
         pts.append((px, py))
     return pts
 
@@ -178,17 +176,18 @@ def _box_pts(x: int, y: int, w: int, h: int, seed: str = "b") -> list[tuple[floa
 
 
 def _arrow_pts(x: int, y_mid: int, seed: str = "a") -> list[list[tuple[float, float]]]:
-    """Hand-drawn arrow with a slightly curved shaft + asymmetric arrowhead."""
+    """Hand-drawn arrow with a slightly curved shaft + asymmetric arrowhead.
+    Shaft length is clamped so the tail can't shoot across the slide into the
+    opposite column."""
     r = _rng(seed)
     tip_x = x - 10 + r.uniform(-3, 3)
     tip_y = y_mid + r.uniform(-4, 4)
-    length = r.uniform(95, 130)
-    angle  = math.pi + r.uniform(-0.35, 0.35)   # mostly leftward, slight tilt
+    length = r.uniform(70, 95)                  # tighter than before
+    angle  = math.pi + r.uniform(-0.18, 0.18)   # mostly leftward, gentle tilt
     tail_x = tip_x + math.cos(angle) * length
     tail_y = tip_y + math.sin(angle) * length
-    # Curved shaft via a quadratic-ish midpoint offset
-    mid_x = (tip_x + tail_x) / 2 + r.uniform(-14, 14)
-    mid_y = (tip_y + tail_y) / 2 + r.uniform(-18, 18)
+    mid_x = (tip_x + tail_x) / 2 + r.uniform(-8, 8)
+    mid_y = (tip_y + tail_y) / 2 + r.uniform(-10, 10)
     shaft = []
     steps = 48
     for i in range(steps + 1):
@@ -249,7 +248,7 @@ def _build_frame_svg(
 
         elif ann_type == "circle":
             cx, cy = x + w / 2, y + h / 2
-            rx, ry = w / 2 + 10, h / 2 + 8
+            rx, ry = w / 2 + 18, h / 2 + 14
             pts = _circle_pts(cx, cy, rx, ry, seed=seed)
             n   = max(2, round(len(pts) * prog))
             paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 4.0, 0.9))
