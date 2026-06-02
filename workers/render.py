@@ -88,28 +88,33 @@ def _rng(seed_key: str) -> random.Random:
 
 
 def _underline_pts(x: int, y_bottom: int, w: int, seed: str = "u") -> list[tuple[float, float]]:
-    """Wavy, slightly sloped underline — looks like a tutor's marker stroke."""
+    """Wavy, slightly sloped underline — tutor's marker stroke. Inset on both ends
+    so it stays *under* the actual word run, never overshooting the text."""
     r = _rng(seed)
-    steps = max(40, w // 6)
-    # Random tiny slope and vertical offset
-    slope = r.uniform(-0.012, 0.012)
-    base_y = y_bottom + r.uniform(3, 8)
-    amp = r.uniform(1.6, 3.2)
-    freq = r.uniform(0.018, 0.035)
+    # Inset ~6% (min 8px, max 28px) so the line never overruns text or crosses boxes
+    inset = max(8, min(28, int(w * 0.06)))
+    x_start = x + inset
+    x_end = max(x_start + 20, x + w - inset)
+    eff_w = x_end - x_start
+    steps = max(30, eff_w // 8)
+    slope = r.uniform(-0.008, 0.008)
+    base_y = y_bottom + r.uniform(2, 5)
+    amp = r.uniform(1.0, 2.0)
+    freq = r.uniform(0.020, 0.040)
     phase = r.uniform(0, math.tau)
     pts: list[tuple[float, float]] = []
     for i in range(steps + 1):
-        px = x + w * i / steps
-        wave = math.sin(phase + (px - x) * freq) * amp
-        jitter = r.uniform(-0.9, 0.9)
-        py = base_y + slope * (px - x) + wave + jitter
+        px = x_start + eff_w * i / steps
+        wave = math.sin(phase + (px - x_start) * freq) * amp
+        jitter = r.uniform(-0.6, 0.6)
+        py = base_y + slope * (px - x_start) + wave + jitter
         pts.append((px, py))
     return pts
 
 
 def _double_underline_pts(x: int, y_bottom: int, w: int, seed: str = "d") -> list[list[tuple[float, float]]]:
     line1 = _underline_pts(x, y_bottom, w, seed + "1")
-    line2 = _underline_pts(x, y_bottom + 9, w, seed + "2")
+    line2 = _underline_pts(x, y_bottom + 7, w, seed + "2")
     return [line1, line2]
 
 
@@ -197,35 +202,36 @@ def _build_frame_svg(
         if ann_type == "underline":
             pts = _underline_pts(x, y + h, w, seed=seed)
             n   = max(2, round(len(pts) * prog))
-            # Two slightly offset passes → marker ink texture
-            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 7.0, 0.85))
-            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 3.5, 0.55))
+            # Lighter, thinner: highlight feel, not strike-through
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 4.2, 0.55))
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 2.0, 0.40))
 
         elif ann_type == "double_underline":
             for li, line_pts in enumerate(_double_underline_pts(x, y + h, w, seed=seed)):
                 n = max(2, round(len(line_pts) * prog))
-                paths_svg.append(_stroke(_pts_to_path(line_pts[:n]), color, 6.0, 0.9))
-                paths_svg.append(_stroke(_pts_to_path(line_pts[:n]), color, 2.8, 0.5))
+                paths_svg.append(_stroke(_pts_to_path(line_pts[:n]), color, 4.0, 0.65))
+                paths_svg.append(_stroke(_pts_to_path(line_pts[:n]), color, 1.8, 0.40))
 
         elif ann_type == "circle":
             cx, cy = x + w / 2, y + h / 2
-            rx, ry = w / 2 + 18, h / 2 + 14
+            # Tighter circle — hugs the word, less padding
+            rx, ry = w / 2 + 10, h / 2 + 8
             pts = _circle_pts(cx, cy, rx, ry, seed=seed)
             n   = max(2, round(len(pts) * prog))
-            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 6.5, 0.9))
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 4.5, 0.85))
 
         elif ann_type == "box":
-            pts = _box_pts(x - 8, y - 6, w + 16, h + 12, seed=seed)
+            pts = _box_pts(x - 6, y - 4, w + 12, h + 8, seed=seed)
             n   = max(2, round(len(pts) * prog))
-            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 6.0, 0.9))
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 4.5, 0.80))
 
         elif ann_type == "arrow":
             shaft, h1, h2 = _arrow_pts(x, y + h // 2, seed=seed)
             n = max(2, round(len(shaft) * prog))
-            paths_svg.append(_stroke(_pts_to_path(shaft[:n]), color, 6.0, 0.9))
+            paths_svg.append(_stroke(_pts_to_path(shaft[:n]), color, 4.5, 0.85))
             if prog > 0.85:
-                paths_svg.append(_stroke(_pts_to_path(h1), color, 6.0, 0.9))
-                paths_svg.append(_stroke(_pts_to_path(h2), color, 6.0, 0.9))
+                paths_svg.append(_stroke(_pts_to_path(h1), color, 4.5, 0.85))
+                paths_svg.append(_stroke(_pts_to_path(h2), color, 4.5, 0.85))
 
     if not paths_svg:
         return ""
