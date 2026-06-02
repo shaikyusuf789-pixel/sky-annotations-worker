@@ -26,23 +26,33 @@ import cairosvg
 from PIL import Image
 
 W, H, FPS = 1920, 1080, 30
+# Annotations start drawing this many seconds BEFORE the spoken word so the
+# visual lands in sync with the voice (compensates for ElevenLabs alignment
+# bias + human perception lag). Override via env if needed.
+ANNOTATION_LEAD = float(os.environ.get("ANNOTATION_LEAD_SECONDS", "0.6"))
 
-# Warmer "marker" palette — feels more like a tutor's highlighter than a UI accent
-STROKE_COLORS = {
-    "underline":         "#ffd54a",  # marker yellow
-    "double_underline":  "#ff7043",  # orange-red (heading)
-    "circle":            "#ff5252",  # red ink
-    "box":               "#26c6da",  # cyan ink
-    "arrow":             "#ab47bc",  # purple ink
-}
+
+# Single-pen mode: ONE color per clip, chosen from slide background brightness.
+# Dark slide → light pen, light slide → dark pen. Set at render time.
+PEN_DARK  = "#111111"   # near-black ink for light slides
+PEN_LIGHT = "#f5f5f5"   # near-white ink for dark slides
 
 DRAW_SECONDS = {
     "underline":         0.9,
-    "double_underline":  1.4,
+    "double_underline":  0.9,   # rendered as a single underline now
     "circle":            1.6,
     "box":               1.8,
-    "arrow":             1.0,
+    "arrow":             1.1,
 }
+
+
+def _pick_pen(slide_rgba: "Image.Image") -> str:
+    """Sample the slide, average brightness → pick black or white pen."""
+    small = slide_rgba.convert("RGB").resize((40, 24), Image.BILINEAR)
+    px = list(small.getdata())
+    # Perceived luminance
+    avg = sum(0.299 * r + 0.587 * g + 0.114 * b for (r, g, b) in px) / len(px)
+    return PEN_LIGHT if avg < 110 else PEN_DARK
 
 
 
@@ -119,19 +129,32 @@ def _double_underline_pts(x: int, y_bottom: int, w: int, seed: str = "d") -> lis
 
 
 def _circle_pts(cx: float, cy: float, rx: float, ry: float, seed: str = "c") -> list[tuple[float, float]]:
-    """Hand-drawn loop — slightly overshoots, varies radius."""
+    """Hand-drawn loop — irregular radius, slight tilt, noticeable overshoot,
+    and a tiny tail-out so it reads as a tutor's quick pen circle, not a CAD ellipse."""
     r = _rng(seed)
-    n = 110
-    start = -math.pi / 2 + r.uniform(-0.2, 0.2)
-    sweep = 2 * math.pi + r.uniform(0.1, 0.45)  # overshoot
+    n = 130
+    start = -math.pi / 2 + r.uniform(-0.5, 0.5)
+    sweep = 2 * math.pi + r.uniform(0.25, 0.7)   # bigger overshoot
+    tilt  = r.uniform(-0.18, 0.18)               # rotate the whole ellipse a touch
+    cos_t, sin_t = math.cos(tilt), math.sin(tilt)
+    # Per-axis low-frequency wobble + per-point jitter so radius varies all the way around
+    wob_amp_x = r.uniform(0.04, 0.09)
+    wob_amp_y = r.uniform(0.04, 0.09)
+    wob_freq_x = r.uniform(1.5, 3.0)
+    wob_freq_y = r.uniform(1.5, 3.0)
+    wob_phase_x = r.uniform(0, math.tau)
+    wob_phase_y = r.uniform(0, math.tau)
     pts: list[tuple[float, float]] = []
     for i in range(n + 1):
         t = i / n
         a = start - sweep * t
-        # Wobble radius
-        wob = 1 + 0.04 * math.sin(t * 6.0 + r.random() * 2) + r.uniform(-0.015, 0.015)
-        px = cx + rx * wob * math.cos(a)
-        py = cy + ry * wob * math.sin(a)
+        wx = 1 + wob_amp_x * math.sin(wob_phase_x + t * math.tau * wob_freq_x) + r.uniform(-0.025, 0.025)
+        wy = 1 + wob_amp_y * math.sin(wob_phase_y + t * math.tau * wob_freq_y) + r.uniform(-0.025, 0.025)
+        ex = rx * wx * math.cos(a)
+        ey = ry * wy * math.sin(a)
+        # apply tilt
+        px = cx + ex * cos_t - ey * sin_t + r.uniform(-0.8, 0.8)
+        py = cy + ex * sin_t + ey * cos_t + r.uniform(-0.8, 0.8)
         pts.append((px, py))
     return pts
 
@@ -155,19 +178,36 @@ def _box_pts(x: int, y: int, w: int, h: int, seed: str = "b") -> list[tuple[floa
 
 
 def _arrow_pts(x: int, y_mid: int, seed: str = "a") -> list[list[tuple[float, float]]]:
+    """Hand-drawn arrow with a slightly curved shaft + asymmetric arrowhead."""
     r = _rng(seed)
-    tip_x = x - 8 + r.uniform(-2, 2)
-    tip_y = y_mid + r.uniform(-3, 3)
-    tail_x = tip_x - 80
-    tail_y = tip_y + r.uniform(-6, 6)
+    tip_x = x - 10 + r.uniform(-3, 3)
+    tip_y = y_mid + r.uniform(-4, 4)
+    length = r.uniform(95, 130)
+    angle  = math.pi + r.uniform(-0.35, 0.35)   # mostly leftward, slight tilt
+    tail_x = tip_x + math.cos(angle) * length
+    tail_y = tip_y + math.sin(angle) * length
+    # Curved shaft via a quadratic-ish midpoint offset
+    mid_x = (tip_x + tail_x) / 2 + r.uniform(-14, 14)
+    mid_y = (tip_y + tail_y) / 2 + r.uniform(-18, 18)
     shaft = []
-    for i in range(40):
-        t = i / 39
-        px = tail_x + (tip_x - tail_x) * t + r.uniform(-1.0, 1.0)
-        py = tail_y + (tip_y - tail_y) * t + math.sin(t * 4) * 1.2
-        shaft.append((px, py))
-    head1 = [(tip_x, tip_y), (tip_x - 18 + r.uniform(-2,2), tip_y - 12 + r.uniform(-2,2))]
-    head2 = [(tip_x, tip_y), (tip_x - 18 + r.uniform(-2,2), tip_y + 12 + r.uniform(-2,2))]
+    steps = 48
+    for i in range(steps + 1):
+        t = i / steps
+        # Quadratic Bezier: tail → mid → tip
+        bx = (1 - t) ** 2 * tail_x + 2 * (1 - t) * t * mid_x + t ** 2 * tip_x
+        by = (1 - t) ** 2 * tail_y + 2 * (1 - t) * t * mid_y + t ** 2 * tip_y
+        shaft.append((bx + r.uniform(-0.6, 0.6), by + r.uniform(-0.6, 0.6)))
+    # Arrowhead pointing along incoming shaft direction
+    ang_in = math.atan2(tip_y - mid_y, tip_x - mid_x)
+    head_len = r.uniform(18, 24)
+    spread1 = r.uniform(0.45, 0.65)
+    spread2 = r.uniform(0.45, 0.65)
+    h1_end = (tip_x - head_len * math.cos(ang_in - spread1),
+              tip_y - head_len * math.sin(ang_in - spread1))
+    h2_end = (tip_x - head_len * math.cos(ang_in + spread2),
+              tip_y - head_len * math.sin(ang_in + spread2))
+    head1 = [(tip_x, tip_y), h1_end]
+    head2 = [(tip_x, tip_y), h2_end]
     return [shaft, head1, head2]
 
 
@@ -179,6 +219,7 @@ def _build_frame_svg(
     progress_map: dict[int, float],  # ann_index → 0.0–1.0
     src_w: int,
     src_h: int,
+    pen: str,
 ) -> str:
     paths_svg = []
 
@@ -195,43 +236,38 @@ def _build_frame_svg(
             continue
 
         ann_type = ann["type"]
-        color    = STROKE_COLORS.get(ann_type, "#ffd54a")
+        # Single-pen mode: every annotation uses the same color for the whole clip.
+        color    = pen
         x, y, w, h = _scale_bbox(ann["bbox"], src_w, src_h)
         seed = f"{idx}-{ann.get('target_text','')[:24]}"
 
-        if ann_type == "underline":
+        # Double underline removed by user request → render as a single underline.
+        if ann_type in ("underline", "double_underline"):
             pts = _underline_pts(x, y + h, w, seed=seed)
             n   = max(2, round(len(pts) * prog))
-            # Lighter, thinner: highlight feel, not strike-through
-            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 4.2, 0.55))
-            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 2.0, 0.40))
-
-        elif ann_type == "double_underline":
-            for li, line_pts in enumerate(_double_underline_pts(x, y + h, w, seed=seed)):
-                n = max(2, round(len(line_pts) * prog))
-                paths_svg.append(_stroke(_pts_to_path(line_pts[:n]), color, 4.0, 0.65))
-                paths_svg.append(_stroke(_pts_to_path(line_pts[:n]), color, 1.8, 0.40))
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 4.0, 0.85))
 
         elif ann_type == "circle":
             cx, cy = x + w / 2, y + h / 2
-            # Tighter circle — hugs the word, less padding
             rx, ry = w / 2 + 10, h / 2 + 8
             pts = _circle_pts(cx, cy, rx, ry, seed=seed)
             n   = max(2, round(len(pts) * prog))
-            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 4.5, 0.85))
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 4.0, 0.9))
 
         elif ann_type == "box":
             pts = _box_pts(x - 6, y - 4, w + 12, h + 8, seed=seed)
             n   = max(2, round(len(pts) * prog))
-            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 4.5, 0.80))
+            paths_svg.append(_stroke(_pts_to_path(pts[:n]), color, 4.0, 0.85))
 
         elif ann_type == "arrow":
             shaft, h1, h2 = _arrow_pts(x, y + h // 2, seed=seed)
             n = max(2, round(len(shaft) * prog))
-            paths_svg.append(_stroke(_pts_to_path(shaft[:n]), color, 4.5, 0.85))
-            if prog > 0.85:
-                paths_svg.append(_stroke(_pts_to_path(h1), color, 4.5, 0.85))
-                paths_svg.append(_stroke(_pts_to_path(h2), color, 4.5, 0.85))
+            paths_svg.append(_stroke(_pts_to_path(shaft[:n]), color, 4.0, 0.9))
+            if prog > 0.7:
+                head_prog = min(1.0, (prog - 0.7) / 0.3)
+                # Draw arrowhead progressively too
+                paths_svg.append(_stroke(_pts_to_path(h1), color, 4.0, 0.9 * head_prog))
+                paths_svg.append(_stroke(_pts_to_path(h2), color, 4.0, 0.9 * head_prog))
 
     if not paths_svg:
         return ""
@@ -295,6 +331,8 @@ def render_clip(
     bg.paste(resized, ((W - nw) // 2, (H - nh) // 2))
     slide_rgba = bg
     slide_bytes = slide_rgba.tobytes()  # reuse for blank frames
+    pen = _pick_pen(slide_rgba)
+    print(f"[RENDER] pen color = {pen} (single-pen mode)")
 
     # Per-annotation draw duration
     draw_durations = [
@@ -348,17 +386,20 @@ def render_clip(
             t = f_idx / FPS
             prog_map: dict[int, float] = {}
             for i, ann in enumerate(annotations):
-                start = float(ann.get("start_time") or 0)
+                start = float(ann.get("start_time") or 0) - ANNOTATION_LEAD
+                if start < 0:
+                    start = 0.0
                 dur   = draw_durations[i]
                 if t < start:
                     continue
                 elapsed = t - start
                 prog_map[i] = 1.0 if elapsed >= dur else _eased(elapsed / dur)
 
+
             if not prog_map:
                 ff.stdin.write(slide_bytes)
             else:
-                svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h)
+                svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h, pen)
                 if svg:
                     png_bytes = cairosvg.svg2png(
                         bytestring=svg.encode(),

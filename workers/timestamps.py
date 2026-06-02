@@ -206,19 +206,76 @@ def _group_into_phrases(
     return phrases
 
 
-def get_timestamps(audio_path: str) -> tuple[list[dict], float]:
-    print(f"[TS] transcribing {audio_path} (language=en forced, romanized)")
+def _elevenlabs_forced_alignment(audio_path: str, script_text: str) -> tuple[list[dict], float]:
+    """Use ElevenLabs Forced Alignment API to align known script text to audio.
+    Returns true per-word timings (~50-100ms accuracy). Much more accurate than
+    transcription because we already know what was said.
 
+    API: POST https://api.elevenlabs.io/v1/forced-alignment
+    Form fields: file=<audio>, text=<script>
+    Response: { "words": [{"text","start","end","loss"}], "characters": [...], "loss": ... }
+    """
+    import httpx
+
+    api_key = config.ELEVENLABS_API_KEY
+    if not api_key:
+        raise RuntimeError("ELEVENLABS_API_KEY not configured")
+    if not script_text or not script_text.strip():
+        raise RuntimeError("forced alignment requires script_text")
+
+    print(f"[TS/ELEVEN] aligning {audio_path} against {len(script_text)} chars of script")
+    with open(audio_path, "rb") as f:
+        resp = httpx.post(
+            "https://api.elevenlabs.io/v1/forced-alignment",
+            headers={"xi-api-key": api_key},
+            files={"file": ("audio.mp3", f, "audio/mpeg")},
+            data={"text": script_text},
+            timeout=300.0,
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"ElevenLabs forced-alignment failed {resp.status_code}: {resp.text[:500]}")
+
+    payload = resp.json()
+    raw_words = payload.get("words") or []
+    words: list[dict] = []
+    for w in raw_words:
+        original = (w.get("text") or "").strip()
+        if not original:
+            continue
+        latin = _to_latin(original)
+        if not latin:
+            continue
+        words.append({
+            "word":     latin,
+            "original": original,
+            "start":    round(float(w.get("start", 0.0) or 0.0), 3),
+            "end":      round(float(w.get("end",   0.0) or 0.0), 3),
+        })
+
+    duration = words[-1]["end"] if words else 0.0
+    chars = payload.get("characters") or []
+    if chars:
+        try:
+            duration = max(duration, float(chars[-1].get("end", duration) or duration))
+        except Exception:
+            pass
+
+    print(f"[TS/ELEVEN] aligned {len(words)} words, duration={duration:.2f}s, loss={payload.get('loss')}")
+    return words, duration
+
+
+def _openai_transcribe_pipeline(audio_path: str) -> tuple[list[dict], float]:
+    """Legacy fallback: OpenAI transcription (gpt-4o-transcribe → whisper-1)."""
     transcription = None
     last_err: Exception | None = None
     for model in ("gpt-4o-transcribe", "whisper-1"):
         try:
             transcription = _transcribe(audio_path, model)
-            print(f"[TS] success with model={model}")
+            print(f"[TS/OPENAI] success with model={model}")
             break
         except Exception as exc:
             last_err = exc
-            print(f"[TS] model={model} failed: {exc!r}")
+            print(f"[TS/OPENAI] model={model} failed: {exc!r}")
             transcription = None
     if transcription is None:
         raise RuntimeError(f"all transcription models failed: {last_err!r}")
@@ -237,15 +294,40 @@ def get_timestamps(audio_path: str) -> tuple[list[dict], float]:
 
     words = _split_multiword_entries(_extract_words(raw_words))
     cov = _coverage(words, duration)
-    print(f"[TS] primary word coverage = {cov*100:.1f}% ({len(words)} words / {duration:.2f}s)")
+    print(f"[TS/OPENAI] primary coverage = {cov*100:.1f}% ({len(words)} words / {duration:.2f}s)")
 
     if cov < 0.70 and raw_segments:
         synth = _synthesize_from_segments(raw_segments, duration)
         synth_cov = _coverage(synth, duration)
-        print(f"[TS] synthesized from segments: coverage = {synth_cov*100:.1f}% ({len(synth)} words)")
+        print(f"[TS/OPENAI] synthesized coverage = {synth_cov*100:.1f}% ({len(synth)} words)")
         if synth_cov > cov and synth:
-            print(f"[TS] using synthesized timings (better coverage)")
             words = synth
 
-    print(f"[TS] returning {len(words)} word-level timestamps, duration={duration:.2f}s")
     return words, duration
+
+
+def get_timestamps(audio_path: str, script_text: str | None = None) -> tuple[list[dict], float]:
+    """Primary: ElevenLabs Forced Alignment (needs script text + ELEVENLABS_API_KEY).
+    Fallback: OpenAI transcription (gpt-4o-transcribe → whisper-1).
+    """
+    print(f"[TS] transcribing {audio_path}, script_text={'yes' if script_text else 'no'}")
+
+    if script_text and config.ELEVENLABS_API_KEY:
+        try:
+            words, duration = _elevenlabs_forced_alignment(audio_path, script_text)
+            if words:
+                print(f"[TS] returning {len(words)} forced-aligned words, duration={duration:.2f}s")
+                return words, duration
+            print("[TS] forced alignment returned 0 words — falling back to OpenAI")
+        except Exception as exc:
+            print(f"[TS] forced alignment failed, falling back to OpenAI: {exc!r}")
+    else:
+        if not script_text:
+            print("[TS] no script_text provided — skipping forced alignment")
+        if not config.ELEVENLABS_API_KEY:
+            print("[TS] ELEVENLABS_API_KEY not set — skipping forced alignment")
+
+    words, duration = _openai_transcribe_pipeline(audio_path)
+    print(f"[TS] returning {len(words)} OpenAI word-level timestamps, duration={duration:.2f}s")
+    return words, duration
+

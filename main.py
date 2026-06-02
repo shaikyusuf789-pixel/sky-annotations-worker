@@ -1,5 +1,6 @@
 """
 main.py — FastAPI application for sky-annotations-worker.
+DEPLOY_MARKER: 2026-06-02-v2 (no double_underline, ANNOTATION_LEAD_SECONDS, 4-5s spacing)
 
 All annotation pipeline routes:
   GET  /health
@@ -193,7 +194,7 @@ def _update_clip_status(script_id: str, chunk_id: str, slide_source: str,
 # HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
-WORKER_VERSION = "2026-06-02.word-level-timestamps-015"
+WORKER_VERSION = "2026-06-02.elevenlabs-forced-alignment-016"
 
 @app.get("/health")
 def health():
@@ -269,6 +270,16 @@ def _resolve_audio_key(script_id: str, chunk_id: str, chunk_number: int) -> str:
     return audio_path(script_id, chunk_number)
 
 
+def _get_chunk_text(chunk_id: str) -> str:
+    try:
+        row = (get_supabase().table("script_chunks")
+               .select("content").eq("id", chunk_id).limit(1).execute())
+        return ((row.data or [{}])[0].get("content") or "").strip()
+    except Exception as e:
+        print(f"[TS] failed to load chunk content for {chunk_id}: {e}")
+        return ""
+
+
 @app.post("/timestamps/run")
 def timestamps_run(req: TsRunReq):
     tmp = None
@@ -276,7 +287,8 @@ def timestamps_run(req: TsRunReq):
         print(f"[TS/run] chunk {req.chunk_number} ({req.chunk_id})")
         key = _resolve_audio_key(req.script_id, req.chunk_id, req.chunk_number)
         tmp = download_to_tmp(AUDIO_BUCKET, key, ".mp3")
-        words, duration = get_timestamps(tmp)
+        script_text = _get_chunk_text(req.chunk_id)
+        words, duration = get_timestamps(tmp, script_text=script_text)
         _upsert_timestamps(req.script_id, req.chunk_id, req.chunk_number, words)
         return {"ok": True, "word_count": len(words), "duration": duration}
     except Exception as e:
@@ -296,13 +308,15 @@ def _ts_all_job(script_id: str) -> None:
             chunk_number = chunk["chunk_index"]
             key = _resolve_audio_key(script_id, chunk_id, chunk_number)
             tmp = download_to_tmp(AUDIO_BUCKET, key, ".mp3")
-            words, _ = get_timestamps(tmp)
+            script_text = (chunk.get("content") or "").strip() or _get_chunk_text(chunk_id)
+            words, _ = get_timestamps(tmp, script_text=script_text)
             _upsert_timestamps(script_id, chunk_id, chunk_number, words)
             print(f"[TS/run-all] chunk {chunk_number} done — {len(words)} words")
         except Exception as e:
             print(f"[TS/run-all] chunk {chunk.get('chunk_index')} FAILED: {e}")
         finally:
             cleanup(tmp)
+
 
 @app.post("/timestamps/run-all")
 def timestamps_run_all(req: TsRunAllReq, bg: BackgroundTasks):

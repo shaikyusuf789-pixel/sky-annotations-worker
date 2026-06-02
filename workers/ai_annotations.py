@@ -58,23 +58,23 @@ semantically related text on the slide. If multiple OCR words form a bullet
 line that means the same thing, annotate the WHOLE LINE. If it's just a key
 term/number/name, annotate that SINGLE WORD.
 
-ANNOTATION TYPES (vary them intentionally based on slide layout):
-  double_underline → THE main slide heading. Use AT MOST ONCE per chunk.
-  underline        → SHORT phrases only (2–5 words). Use sparingly — a real
-                     tutor doesn't underline full sentences. Max 2 full-line
-                     underlines per chunk; the rest must be short phrases.
-  circle           → PREFERRED for spotlighting a single keyword, number,
-                     name, or 1–3 word phrase. Use this most often.
-                     HARD RULE: target_text for a circle MUST be ≤ 4 words
-                     AND ≤ 30 characters AND fit on a single visual line.
-                     NEVER circle a whole bullet, sentence, or multi-line
-                     block — circles are tight keyword loops, not lassos
-                     around paragraphs. If the bbox height is more than
-                     1.8× the average word height, it's too tall for a
-                     circle — switch to a short underline instead.
-  box              → frame a statistic, formula, or grouped block
-                     (only for already-grouped callouts, not bullets).
-  arrow            → point to a list item or a concept being introduced
+ANNOTATION TYPES (mix them so the slide feels alive, not just underlined):
+  underline → SHORT phrases only (2–5 words). Use sparingly — a real tutor
+              doesn't underline full sentences. Max 4 per chunk.
+  circle    → PREFERRED for spotlighting a single keyword, number, name,
+              or 1–3 word phrase. Use this often.
+              HARD RULE: target_text MUST be ≤ 4 words AND ≤ 30 characters
+              AND fit on a single visual line. Never circle a paragraph.
+  box       → frame a statistic, formula, or grouped callout (only for
+              already-grouped blocks, not individual bullets).
+  arrow     → point AT a bullet, name, number, or callout when the narrator
+              draws attention to it. Use arrows often — they add motion and
+              break the monotony of underlines/circles.
+
+  DO NOT use "double_underline" — it is deprecated. Use "underline" instead.
+
+  TARGET MIX per chunk (rough guideline, 15 annotations):
+    ~6 circles · ~4 underlines · ~3 arrows · ~2 boxes
 
 TIMING RULES
   • start_time = the audio time (in seconds) when the corresponding spoken
@@ -198,9 +198,9 @@ HARD RULES:
 6. target_text MUST be the EXACT OCR text (copy character-for-character).
    For multi-word targets, concatenate consecutive OCR words with single
    spaces in the order they appear in the OCR dump.
-7. Vary types. double_underline at most ONCE (the heading). Lean heavily
-   on `circle` for keywords. Mix in short `underline`, occasional `box`
-   or `arrow` so it feels like a real tutor.
+7. Vary types. DO NOT use double_underline. Lean on `circle` for keywords,
+   short `underline` for phrases, plenty of `arrow` for callouts, and the
+   occasional `box` for grouped callouts so it feels like a real tutor.
 8. Return 12–20 annotations, chronologically ordered, with start_times
    spaced at least 4 seconds apart and ALL within the speech window.
 
@@ -242,6 +242,8 @@ Return ONLY the JSON object."""
     clean: list[dict[str, Any]] = []
     for ann in annotations:
         t = ann.get("type")
+        if t == "double_underline":
+            t = "underline"   # deprecated — collapse to single underline
         if t not in allowed_types:
             continue
         target = str(ann.get("target_text") or "").strip()
