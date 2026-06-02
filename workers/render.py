@@ -267,40 +267,54 @@ def render_clip(
         stderr=subprocess.PIPE,
     )
 
-    for f_idx in range(total_frames):
-        t = f_idx / FPS
-        prog_map: dict[int, float] = {}
-        for i, ann in enumerate(annotations):
-            start = float(ann.get("start_time") or 0)
-            dur   = draw_durations[i]
-            if t < start:
-                continue
-            elapsed = t - start
-            prog_map[i] = 1.0 if elapsed >= dur else _eased(elapsed / dur)
+    try:
+        for f_idx in range(total_frames):
+            t = f_idx / FPS
+            prog_map: dict[int, float] = {}
+            for i, ann in enumerate(annotations):
+                start = float(ann.get("start_time") or 0)
+                dur   = draw_durations[i]
+                if t < start:
+                    continue
+                elapsed = t - start
+                prog_map[i] = 1.0 if elapsed >= dur else _eased(elapsed / dur)
 
-        if not prog_map:
-            ff.stdin.write(slide_bytes)
-        else:
-            svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h)
-            if svg:
-                png_bytes = cairosvg.svg2png(
-                    bytestring=svg.encode(),
-                    output_width=W,
-                    output_height=H,
-                )
-                overlay = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-                frame   = Image.alpha_composite(slide_rgba, overlay)
-                ff.stdin.write(frame.tobytes())
-            else:
+            if not prog_map:
                 ff.stdin.write(slide_bytes)
+            else:
+                svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h)
+                if svg:
+                    png_bytes = cairosvg.svg2png(
+                        bytestring=svg.encode(),
+                        output_width=W,
+                        output_height=H,
+                    )
+                    overlay = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+                    frame   = Image.alpha_composite(slide_rgba, overlay)
+                    ff.stdin.write(frame.tobytes())
+                else:
+                    ff.stdin.write(slide_bytes)
+    except (BrokenPipeError, ValueError, OSError) as pipe_err:
+        # ffmpeg likely died — drain stderr to surface the real reason
+        try:
+            ff.stdin.close()
+        except Exception:
+            pass
+        _, stderr_data = ff.communicate(timeout=30)
+        ff_err = stderr_data[-2000:].decode(errors="replace") if stderr_data else ""
+        raise RuntimeError(f"ffmpeg pipe failed ({pipe_err}); ffmpeg stderr: {ff_err}")
 
-    ff.stdin.close()
+    try:
+        ff.stdin.close()
+    except Exception:
+        pass
     _, stderr_data = ff.communicate()
     if ff.returncode != 0:
         raise RuntimeError(
             f"ffmpeg exited {ff.returncode}: "
-            + stderr_data[-2000:].decode(errors="replace")
+            + (stderr_data[-2000:].decode(errors="replace") if stderr_data else "")
         )
+
 
     print(f"[RENDER] done → {output_path}")
     return audio_dur
