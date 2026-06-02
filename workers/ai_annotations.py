@@ -214,16 +214,38 @@ Return ONLY the JSON object."""
             "image_url": {"url": slide_image_url, "detail": "high"},
         })
 
-    response = _openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user",   "content": user_content},
-        ],
-        response_format={"type": "json_object"},
-        max_tokens=4000,
-        temperature=0.3,
-    )
+    import time as _time
+    last_err: Exception | None = None
+    response = None
+    for attempt in range(6):
+        try:
+            response = _openai.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_content},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=4000,
+                temperature=0.3,
+            )
+            break
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            is_429 = "429" in msg or "rate_limit" in msg.lower() or "rate limit" in msg.lower()
+            if not is_429 or attempt == 5:
+                raise
+            wait_s = 12.0
+            m = re.search(r"try again in ([\d.]+)s", msg)
+            if m:
+                try: wait_s = float(m.group(1)) + 2.0
+                except Exception: pass
+            wait_s = min(60.0, max(wait_s, 5.0 * (attempt + 1)))
+            print(f"[AI] 429 rate-limited (attempt {attempt+1}/6) — sleeping {wait_s:.1f}s")
+            _time.sleep(wait_s)
+    if response is None:
+        raise last_err or RuntimeError("OpenAI call failed")
 
     raw = response.choices[0].message.content or "{}"
     try:
