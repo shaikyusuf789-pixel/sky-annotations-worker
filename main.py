@@ -193,9 +193,15 @@ def _update_clip_status(script_id: str, chunk_id: str, slide_source: str,
 # HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
+WORKER_VERSION = "2026-06-02.padded-audio-002"
+
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "sky-annotations-worker"}
+    return {"ok": True, "service": "sky-annotations-worker", "version": WORKER_VERSION}
+
+@app.get("/version")
+def version():
+    return {"version": WORKER_VERSION}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -249,12 +255,27 @@ def ocr_run_all(req: OcrRunAllReq, bg: BackgroundTasks):
 # TIMESTAMPS ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _resolve_audio_key(script_id: str, chunk_id: str, chunk_number: int) -> str:
+    """Resolve the audio storage key from chunks.audio_url, with legacy fallback."""
+    try:
+        row = (get_supabase().table("script_chunks")
+               .select("audio_url").eq("id", chunk_id).limit(1).execute())
+        url = (row.data or [{}])[0].get("audio_url") or ""
+        marker = f"/{AUDIO_BUCKET}/"
+        if marker in url:
+            return url.split(marker, 1)[1].split("?", 1)[0]
+    except Exception as e:
+        print(f"[AUDIO] resolve from DB failed: {e}")
+    return audio_path(script_id, chunk_number)
+
+
 @app.post("/timestamps/run")
 def timestamps_run(req: TsRunReq):
     tmp = None
     try:
         print(f"[TS/run] chunk {req.chunk_number} ({req.chunk_id})")
-        tmp = download_to_tmp(AUDIO_BUCKET, audio_path(req.script_id, req.chunk_number), ".mp3")
+        key = _resolve_audio_key(req.script_id, req.chunk_id, req.chunk_number)
+        tmp = download_to_tmp(AUDIO_BUCKET, key, ".mp3")
         words, duration = get_timestamps(tmp)
         _upsert_timestamps(req.script_id, req.chunk_id, req.chunk_number, words)
         return {"ok": True, "word_count": len(words), "duration": duration}
@@ -273,7 +294,8 @@ def _ts_all_job(script_id: str) -> None:
         try:
             chunk_id     = chunk["id"]
             chunk_number = chunk["chunk_index"]
-            tmp = download_to_tmp(AUDIO_BUCKET, audio_path(script_id, chunk_number), ".mp3")
+            key = _resolve_audio_key(script_id, chunk_id, chunk_number)
+            tmp = download_to_tmp(AUDIO_BUCKET, key, ".mp3")
             words, _ = get_timestamps(tmp)
             _upsert_timestamps(script_id, chunk_id, chunk_number, words)
             print(f"[TS/run-all] chunk {chunk_number} done — {len(words)} words")
@@ -310,16 +332,25 @@ def ai_run(req: AiRunReq):
         if not ts_words:
             raise HTTPException(status_code=400, detail="No timestamp words found — re-run Timestamps")
 
-        # Fetch chunk text from script_chunks
+        # Fetch chunk text + slide image url + slide prompt
         chunk_text = ""
-        res = (get_supabase().table("script_chunks").select("content")
+        slide_url = None
+        slide_prompt = None
+        res = (get_supabase().table("script_chunks")
+               .select("content,slide_url,slide_prompt")
                .eq("id", req.chunk_id).limit(1).execute())
         if res.data:
-            chunk_text = res.data[0].get("content", "")
+            chunk_text   = res.data[0].get("content", "") or ""
+            slide_url    = res.data[0].get("slide_url")
+            slide_prompt = res.data[0].get("slide_prompt")
 
-        annotations = generate_annotations(ocr_words, ts_words, chunk_text, req.chunk_number)
+        annotations = generate_annotations(
+            ocr_words, ts_words, chunk_text, req.chunk_number,
+            slide_image_url=slide_url, slide_prompt=slide_prompt,
+        )
         _upsert_ai(req.script_id, req.chunk_id, req.chunk_number, req.slide_source, annotations)
         return {"ok": True, "annotation_count": len(annotations)}
+
     except HTTPException:
         raise
     except Exception as e:
@@ -343,10 +374,16 @@ def _ai_all_job(script_id: str, slide_source: str) -> None:
             ts_words   = json.loads(ts_row["words"])
             if not ts_words:
                 continue
-            chunk_text = chunk.get("content", "")
-            annotations = generate_annotations(ocr_words, ts_words, chunk_text, chunk_number)
+            chunk_text   = chunk.get("content", "") or ""
+            slide_url    = chunk.get("slide_url")
+            slide_prompt = chunk.get("slide_prompt")
+            annotations = generate_annotations(
+                ocr_words, ts_words, chunk_text, chunk_number,
+                slide_image_url=slide_url, slide_prompt=slide_prompt,
+            )
             _upsert_ai(script_id, chunk_id, chunk_number, slide_source, annotations)
             print(f"[AI/run-all] chunk {chunk_number} done — {len(annotations)} annotations")
+
         except Exception as e:
             print(f"[AI/run-all] chunk {chunk.get('chunk_index')} FAILED: {e}")
 
@@ -374,7 +411,7 @@ def _render_job(script_id: str, chunk_id: str, chunk_number: int, slide_source: 
             raise ValueError("Annotations not found — run AI step first")
 
         tmp_slide = download_slide_to_tmp(script_id, chunk_number, ".png")
-        tmp_audio = download_to_tmp(AUDIO_BUCKET, audio_path(script_id, chunk_number), ".mp3")
+        tmp_audio = download_to_tmp(AUDIO_BUCKET, _resolve_audio_key(script_id, chunk_id, chunk_number), ".mp3")
 
         tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir="/tmp/render").name
         annotations = json.loads(ai_row["annotations"])
