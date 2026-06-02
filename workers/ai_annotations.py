@@ -113,9 +113,8 @@ def _ocr_lines(ocr_words: list[dict]) -> str:
     out = []
     for i, w in enumerate(ocr_words):
         text = w.get("text", "")
-        conf = w.get("confidence") or w.get("conf") or 0
         out.append(
-            f'  [{i:03d}] "{text}"  bbox=[{w.get("x",0)},{w.get("y",0)},{w.get("w",0)},{w.get("h",0)}]  conf={conf}'
+            f'  [{i:03d}] "{text}"  bbox=[{w.get("x",0)},{w.get("y",0)},{w.get("w",0)},{w.get("h",0)}]'
         )
     return "\n".join(out)
 
@@ -211,7 +210,7 @@ Return ONLY the JSON object."""
     if slide_image_url:
         user_content.append({
             "type": "image_url",
-            "image_url": {"url": slide_image_url, "detail": "high"},
+            "image_url": {"url": slide_image_url, "detail": "auto"},
         })
 
     import time as _time
@@ -220,7 +219,7 @@ Return ONLY the JSON object."""
     for attempt in range(6):
         try:
             response = _openai.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user",   "content": user_content},
