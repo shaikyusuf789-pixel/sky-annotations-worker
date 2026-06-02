@@ -193,7 +193,7 @@ def _update_clip_status(script_id: str, chunk_id: str, slide_source: str,
 # HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
-WORKER_VERSION = "2026-06-02.handdrawn-bbox-fix-007"
+WORKER_VERSION = "2026-06-02.tight-strokes-008"
 
 @app.get("/health")
 def health():
