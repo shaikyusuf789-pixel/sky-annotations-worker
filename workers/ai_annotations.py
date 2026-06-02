@@ -65,7 +65,15 @@ ANNOTATION TYPES (vary them intentionally based on slide layout):
                      underlines per chunk; the rest must be short phrases.
   circle           → PREFERRED for spotlighting a single keyword, number,
                      name, or 1–3 word phrase. Use this most often.
+                     HARD RULE: target_text for a circle MUST be ≤ 4 words
+                     AND ≤ 30 characters AND fit on a single visual line.
+                     NEVER circle a whole bullet, sentence, or multi-line
+                     block — circles are tight keyword loops, not lassos
+                     around paragraphs. If the bbox height is more than
+                     1.8× the average word height, it's too tall for a
+                     circle — switch to a short underline instead.
   box              → frame a statistic, formula, or grouped block
+                     (only for already-grouped callouts, not bullets).
   arrow            → point to a list item or a concept being introduced
 
 TIMING RULES
@@ -245,6 +253,25 @@ Return ONLY the JSON object."""
             })
         except (TypeError, ValueError):
             continue
+
+    # Safety net: demote oversized "circle" annotations to a short "underline".
+    # GPT sometimes circles entire bullets / multi-line blocks, which looks like
+    # a lasso around a paragraph. If the bbox is tall (multi-line) or the target
+    # text has too many words/chars, switch to underline so it reads as a
+    # highlight under the phrase instead of a giant loop.
+    if ocr_words:
+        avg_h = sum(int(w.get("h", 0)) for w in ocr_words) / max(len(ocr_words), 1)
+    else:
+        avg_h = 0
+    for ann in clean:
+        if ann["type"] != "circle":
+            continue
+        words = ann["target_text"].split()
+        bbox_h = ann["bbox"][3] if len(ann["bbox"]) == 4 else 0
+        too_tall = avg_h > 0 and bbox_h > avg_h * 1.8
+        too_wordy = len(words) > 4 or len(ann["target_text"]) > 30
+        if too_tall or too_wordy:
+            ann["type"] = "underline"
 
     # Drop duplicate bboxes (GPT often collapses several phrases onto the same
     # heading bbox — keep only the first occurrence per bbox).
