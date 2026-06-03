@@ -16,6 +16,7 @@ find the closest matching word / phrase / line on the slide and annotate it.
 
 import json
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 from openai import OpenAI
@@ -74,15 +75,26 @@ ANNOTATION TYPES (mix them so the slide feels alive, not just underlined):
   DO NOT use "double_underline" — it is deprecated. Use "underline" instead.
 
   TARGET MIX per chunk (rough guideline, 15 annotations):
-    ~6 circles · ~4 underlines · ~3 arrows · ~2 boxes
+    ~4 circles · ~4 underlines · ~3 arrows · ~2 boxes
 
-TIMING RULES
-  • start_time = the audio time (in seconds) when the corresponding spoken
-    concept BEGINS in the timestamps. Use semantic alignment — find the
-    transliterated word(s) in the timestamps that correspond to the
-    concept, take the start time of the first such word.
-  • Annotations should flow in chronological order, matching the narration.
-  • Two annotations may share a start_time only when truly simultaneous.
+TIMING — CRITICAL CHANGE
+  • You DO NOT pick start_time anymore. Python will compute it from the
+    real word timestamps. Your job is to tell Python WHICH spoken words
+    correspond to each annotation, via `script_phrase`.
+  • `script_phrase` MUST be a short consecutive run of words (2–6 words
+    is ideal, 1 word OK for unique terms) copied VERBATIM from the
+    WORD-LEVEL TIMESTAMPS list (the Latin/transliterated column on the
+    right of the arrow). Example: if the timestamps contain
+       34.66s → 34.90s  "yild"
+       34.96s → 35.22s  "tapiks"
+    and the slide says "High Yield Topics", then for that annotation:
+       "script_phrase": "yild tapiks"
+  • Pick the script_phrase that BEST identifies WHEN the narrator is
+    talking about this concept. If a phrase repeats in the timestamps
+    (e.g. "SSC" appears twice), pick the occurrence that matches the
+    chronological order of the slide narration.
+  • Still keep `start_time` in the JSON as a fallback hint (your best
+    guess from the timestamps), but Python will overwrite it.
 
 TARGET TEXT RULES
   • target_text MUST be the EXACT OCR text from the slide (so the renderer
@@ -97,14 +109,15 @@ QUANTITY & DISTRIBUTION
   • Aim for 12–25 annotations per chunk (more if the slide is text-dense,
     fewer if it's very sparse — but always try to cover EVERY major concept
     spoken in the script).
-  • Spread annotations across the entire chunk duration. Do not cluster
-    them all in the first 2 seconds.
+  • Annotations MUST be in CHRONOLOGICAL ORDER of their script_phrase
+    appearance in the timestamps.
   • Do not annotate the same OCR text more than once unless the script
     references it at clearly distinct times.
 
 OUTPUT FORMAT — return ONLY valid JSON (no markdown fences, no commentary):
 {"annotations": [
-  {"type": "double_underline", "start_time": 0.0, "target_text": "IPL 2026", "bbox": [137, 349, 121, 65]},
+  {"type": "circle", "start_time": 6.40, "script_phrase": "SSC CGL", "target_text": "SSC CGL 2026", "bbox": [262,343,640,81]},
+  {"type": "arrow",  "start_time": 34.66, "script_phrase": "hai yild tapiks", "target_text": "high yield topics", "bbox": [356,971,280,34]},
   ...
 ]}"""
 
@@ -181,27 +194,25 @@ HARD RULES:
 
 === TASK ===
 1. Look at the slide image — note the heading, bullets, layout.
-2. Read the script and identify EVERY meaningful concept the narrator says
-   (key terms, numbers, names, definitions, phrases). Distribute annotations
-   evenly across the SPEECH WINDOW above — roughly one annotation every
-   4–5 seconds. Do NOT place anything before {speech_start:.2f}s.
+2. Read the script and identify EVERY meaningful concept the narrator says.
 3. For each concept, find the matching word/phrase/line on the slide
    (semantic match — slide wording is paraphrased from the script).
 4. STRONGLY PREFER short keyword targets: single words, numbers, names, or
-   2–4 word phrases. CIRCLE them when possible — like a tutor circling a
-   key term ("Focus", "Facts", "20", "Kohli"). Full-line underlines are
-   visually heavy; cap them at MAX 2 per chunk, and only use them when the
-   narrator literally summarises the whole bullet.
-5. start_time = the timestamp of the FIRST word the narrator actually says
-   that maps to this concept (from the WORD-LEVEL TIMESTAMPS — not guessed).
+   2–4 word phrases. CIRCLE them when possible. Cap full-line underlines at
+   MAX 2 per chunk.
+5. For EACH annotation, copy a `script_phrase` of 2–6 consecutive Latin
+   words from the WORD-LEVEL TIMESTAMPS that the narrator says when this
+   concept is mentioned. Python will look it up and assign the real
+   start_time. If a phrase repeats (e.g. "SSC" twice), pick the occurrence
+   matching chronological order with your other annotations.
 6. target_text MUST be the EXACT OCR text (copy character-for-character).
    For multi-word targets, concatenate consecutive OCR words with single
    spaces in the order they appear in the OCR dump.
 7. Vary types. DO NOT use double_underline. Lean on `circle` for keywords,
    short `underline` for phrases, plenty of `arrow` for callouts, and the
-   occasional `box` for grouped callouts so it feels like a real tutor.
-8. Return 12–20 annotations, chronologically ordered, with start_times
-   spaced at least 4 seconds apart and ALL within the speech window.
+   occasional `box` for grouped callouts.
+8. Return 12–20 annotations, ORDERED by appearance of their script_phrase
+   in the timestamps.
 
 Return ONLY the JSON object."""
 
@@ -219,7 +230,7 @@ Return ONLY the JSON object."""
     for attempt in range(6):
         try:
             response = _openai.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user",   "content": user_content},
@@ -257,39 +268,69 @@ Return ONLY the JSON object."""
     if not isinstance(annotations, list):
         annotations = []
 
-    # Sanitise + RECOMPUTE bbox from OCR (GPT often returns wrong bboxes for
-    # multi-word phrases — it copies the title's bbox or the first OCR bbox).
+    # Sanitise + RECOMPUTE bbox from OCR + RECOMPUTE start_time from real
+    # ElevenLabs timestamps using the model-supplied `script_phrase`.
+    # GPT can't be trusted with numeric grounding — it hallucinates timestamps
+    # 10–20 seconds off the actual spoken word. We use Python to look up the
+    # phrase in ts_words and copy the real start time.
     allowed_types = {"underline", "double_underline", "circle", "box", "arrow"}
     clean: list[dict[str, Any]] = []
+    last_assigned_start = -1.0  # enforce chronological ordering for repeats
+
     for ann in annotations:
         t = ann.get("type")
         if t == "double_underline":
-            t = "underline"   # deprecated — collapse to single underline
+            t = "underline"
         if t not in allowed_types:
             continue
         target = str(ann.get("target_text") or "").strip()
         if not target:
             continue
 
+        # ── bbox: locate via OCR (never trust GPT's bbox).
         located = _locate_phrase_bbox(target, ocr_words)
         if located is None:
-            bbox = ann.get("bbox")
-            if not isinstance(bbox, list) or len(bbox) != 4:
-                continue
-            try:
-                located = [int(v) for v in bbox]
-            except (TypeError, ValueError):
-                continue
-
-        try:
-            clean.append({
-                "type":        t,
-                "start_time":  max(0.0, float(ann.get("start_time") or 0)),
-                "target_text": target,
-                "bbox":        located,
-            })
-        except (TypeError, ValueError):
+            print(f"[AI] DROP: target_text '{target}' not found in OCR")
             continue
+
+        # ── start_time: look up script_phrase in real word timestamps.
+        script_phrase = str(ann.get("script_phrase") or "").strip()
+        gpt_start = None
+        try:
+            gpt_start = float(ann.get("start_time") or 0)
+        except (TypeError, ValueError):
+            gpt_start = None
+
+        real_start = _locate_phrase_start_time(
+            script_phrase, ts_words, min_start=last_assigned_start
+        )
+        target_start = _locate_target_start_time(
+            target, ts_words, min_start=last_assigned_start
+        )
+        if target_start is not None and (
+            real_start is None or abs(float(target_start) - float(real_start)) > 1.25
+        ):
+            if real_start is not None:
+                print(f"[AI] REPAIR: target '{target}' timing {real_start:.2f}s → {target_start:.2f}s")
+            real_start = target_start
+        if real_start is None and gpt_start is not None:
+            # Fallback: use GPT's number but warn loudly in logs.
+            print(f"[AI] WARN: script_phrase '{script_phrase}' not found in "
+                  f"ts_words for target '{target}' — falling back to GPT "
+                  f"start_time {gpt_start:.2f}s")
+            real_start = gpt_start
+        if real_start is None:
+            print(f"[AI] DROP: no script_phrase and no start_time for '{target}'")
+            continue
+
+        last_assigned_start = max(last_assigned_start, real_start)
+
+        clean.append({
+            "type":        t,
+            "start_time":  max(0.0, float(real_start)),
+            "target_text": target,
+            "bbox":        located,
+        })
 
     # Safety net: demote oversized "circle" annotations to a short "underline".
     # GPT sometimes circles entire bullets / multi-line blocks, which looks like
@@ -413,3 +454,150 @@ def _locate_phrase_bbox(phrase: str, ocr_words: list[dict]) -> list[int] | None:
         return None
     return [min(xs), min(ys), max(x2s) - min(xs), max(y2s) - min(ys)]
 
+
+# ── Phrase → start_time locator (deterministic, no LLM) ──────────────────────
+
+def _locate_phrase_start_time(
+    phrase: str,
+    ts_words: list[dict],
+    min_start: float = -1.0,
+) -> float | None:
+    """
+    Find a consecutive run of ts_words whose joined normalized text contains
+    (or is contained by) the normalized `phrase`, and return the .start of
+    the first matched word. Prefers matches with start >= min_start to keep
+    annotations chronologically advancing when the same phrase repeats.
+
+    Returns None if no acceptable match exists.
+    """
+    if not phrase or not ts_words:
+        return None
+    target = _norm(phrase)
+    if not target:
+        return None
+
+    # Normalize each ts_word.
+    norm = []
+    for w in ts_words:
+        s = w.get("word") or w.get("text") or ""
+        norm.append(_norm(s))
+    n = len(ts_words)
+
+    candidates: list[tuple[float, int, float]] = []  # (score, i, start)
+
+    for i in range(n):
+        joined = ""
+        for j in range(i, min(n, i + 12)):  # max 12-word window
+            joined += norm[j]
+            if not joined:
+                continue
+            score = None
+            if target in joined:
+                overshoot = len(joined) - len(target)
+                score = 1.0 - (overshoot / max(len(target), 1)) * 0.2
+            elif joined in target and len(joined) / len(target) >= 0.6:
+                score = (len(joined) / len(target)) * 0.85
+            if score is not None:
+                try:
+                    start = float(ts_words[i].get("start", 0.0))
+                except (TypeError, ValueError):
+                    start = 0.0
+                candidates.append((score, i, start))
+                if target in joined:
+                    break
+            if len(joined) > len(target) * 2.5:
+                break
+
+    if not candidates:
+        return None
+
+    # Prefer the earliest match whose start >= min_start (chronological).
+    forward = [c for c in candidates if c[2] >= min_start - 0.01]
+    pool = forward if forward else candidates
+    # Among the pool, take the best score; tie-break by smallest start.
+    pool.sort(key=lambda c: (-c[0], c[2]))
+    return pool[0][2]
+
+
+def _locate_target_start_time(
+    target_text: str,
+    ts_words: list[dict],
+    min_start: float = -1.0,
+) -> float | None:
+    """Map visible slide text back to spoken timestamp words.
+
+    GPT sometimes supplies a weak `script_phrase` for a good visual target
+    (for example target_text="acceleration" but script_phrase="adugutaru").
+    This deterministic repair looks for the target itself, plus common
+    Telugu-English phonetic spellings produced by forced alignment.
+    """
+    if not target_text or not ts_words:
+        return None
+
+    variants = _target_variants(target_text)
+    if not variants:
+        return None
+
+    norm_words = [_norm(w.get("word") or w.get("text") or "") for w in ts_words]
+    candidates: list[tuple[float, float]] = []  # (score, start)
+    for i in range(len(ts_words)):
+        joined = ""
+        for j in range(i, min(len(ts_words), i + 8)):
+            joined += norm_words[j]
+            if not joined:
+                continue
+            for variant in variants:
+                if not variant:
+                    continue
+                score = 0.0
+                if variant in joined or joined in variant:
+                    score = min(len(variant), len(joined)) / max(len(variant), len(joined), 1)
+                    score = max(score, 0.88)
+                else:
+                    score = SequenceMatcher(None, variant, joined).ratio()
+                if score >= 0.78:
+                    try:
+                        start = float(ts_words[i].get("start", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        start = 0.0
+                    if start >= min_start - 0.01:
+                        candidates.append((score, start))
+            if len(joined) > 80:
+                break
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (-c[0], c[1]))
+    return candidates[0][1]
+
+
+def _target_variants(target_text: str) -> list[str]:
+    words = re.findall(r"[A-Za-z0-9]+", target_text.lower())
+    variants: set[str] = set()
+    if words:
+        variants.add("".join(words))
+        for w in words:
+            if len(w) >= 3:
+                variants.add(w)
+
+    phrase_map = {
+        "skyacademy": ["skyacademy"],
+        "ssccgl2026": ["ssccgl2026", "ssccgl"],
+        "highyield": ["highyield", "haiyild", "yild"],
+        "topics": ["topics", "tapiks", "tapik"],
+        "physics": ["physics", "phijiks", "phijik", "fijiks"],
+        "motion": ["motion", "mosn"],
+        "force": ["force", "phors", "fors"],
+        "mass": ["mass", "mas"],
+        "important": ["important", "impartemt", "impartment"],
+        "acceleration": ["acceleration", "yaksilresn", "aksilresn", "accilresn"],
+        "fma": ["fma"],
+    }
+    compact = "".join(words)
+    for key, vals in phrase_map.items():
+        if key in compact or compact in key:
+            variants.update(vals)
+    for w in words:
+        variants.update(phrase_map.get(w, []))
+
+    return sorted({_norm(v) for v in variants if _norm(v)}, key=len, reverse=True)

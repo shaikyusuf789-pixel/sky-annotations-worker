@@ -1,6 +1,6 @@
 """
 main.py — FastAPI application for sky-annotations-worker.
-DEPLOY_MARKER: 2026-06-02-v2 (no double_underline, ANNOTATION_LEAD_SECONDS, 4-5s spacing)
+DEPLOY_MARKER: 2026-06-03-v3 (target-text timing repair + formula/phonetic matching)
 
 All annotation pipeline routes:
   GET  /health
@@ -194,7 +194,7 @@ def _update_clip_status(script_id: str, chunk_id: str, slide_source: str,
 # HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
-WORKER_VERSION = "2026-06-02.elevenlabs-forced-alignment-016"
+WORKER_VERSION = "2026-06-03.elevenlabs-forced-alignment-017-target-timing-repair"
 
 @app.get("/health")
 def health():
