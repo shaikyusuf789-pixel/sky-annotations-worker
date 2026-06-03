@@ -1,3 +1,4 @@
+# Updated: 2026-06-03 17:35
 """
 main.py — FastAPI application for sky-annotations-worker.
 
