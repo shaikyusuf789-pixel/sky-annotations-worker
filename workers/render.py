@@ -14,6 +14,7 @@ Annotation colors:
   arrow            → #8b5cf6
 """
 
+import gc
 import io
 import math
 import random
@@ -26,6 +27,11 @@ import cairosvg
 from PIL import Image
 
 W, H, FPS = 1920, 1080, 30
+# To save memory (Railway 512MB limit), we render the overlay at 0.5x scale
+# and let ffmpeg scale it up during composite. CairoSVG + Pillow are 4x faster.
+DOWNSCALE = 2
+OW, OH = W // DOWNSCALE, H // DOWNSCALE
+
 # Annotations start drawing this many seconds BEFORE the spoken word so the
 # visual lands in sync with the voice (compensates for ElevenLabs alignment
 # bias + human perception lag). Override via env if needed.
@@ -276,7 +282,7 @@ def _build_frame_svg(
         return ""
 
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{OW}" height="{OH}" viewBox="0 0 {W} {H}">'
         + "".join(paths_svg)
         + "</svg>"
     )
@@ -311,14 +317,6 @@ def render_clip(
     Render an annotated MP4 clip.
 
     Returns the clip duration in seconds.
-
-    Parameters
-    ----------
-    slide_path   : local PNG path (any resolution — will be letterboxed to 1920×1080)
-    audio_path   : local MP3/AAC/WAV path
-    annotations  : list of annotation dicts (type, start_time, bbox, …)
-    output_path  : where to write the MP4
-    ocr_src_w/h  : resolution of the image OCR ran on (for correct bbox scaling)
     """
     audio_dur    = get_audio_duration(audio_path)
     total_frames = math.ceil(audio_dur * FPS)
@@ -333,7 +331,9 @@ def render_clip(
     resized = raw_slide.resize((nw, nh), Image.LANCZOS)
     bg.paste(resized, ((W - nw) // 2, (H - nh) // 2))
     slide_rgba = bg
-    slide_bytes = slide_rgba.tobytes()  # reuse for blank frames
+    # Downscaled background for compositing (memory efficiency)
+    slide_rgba_half = slide_rgba.resize((OW, OH), Image.BILINEAR)
+    slide_bytes_half = slide_rgba_half.tobytes()
     pen = _pick_pen(slide_rgba)
     print(f"[RENDER] pen color = {pen} (single-pen mode)")
 
@@ -344,12 +344,6 @@ def render_clip(
     ]
 
     # ── Serialize annotation visual starts (pen-lift) ──────────────────────
-    # A real tutor only draws one stroke at a time. We pre-compute the
-    # effective on-screen start for each annotation by chronological order:
-    # if its scheduled start would overlap the previous stroke's animation,
-    # push it to (prev_effective_start + prev_draw_duration + PEN_LIFT).
-    # Only the visual draw is serialized — original ordering / spoken-word
-    # anchors are otherwise preserved.
     order = sorted(
         range(len(annotations)),
         key=lambda i: float(annotations[i].get("start_time") or 0),
@@ -364,19 +358,19 @@ def render_clip(
         effective_start[i] = start
         prev_end = start + draw_durations[i]
 
-
-    # Start FFmpeg in a 2-pass-friendly way: write raw frames to a temp file
-    # first (avoids pipe-buffer/encoder back-pressure issues that have been
-    # causing "flush of closed file" errors), then encode in one shot.
     import threading
 
+    # We composite at half-res and let ffmpeg upscale back to 1080p.
+    # This reduces Python/Pillow memory footprint significantly.
     ff_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-f", "rawvideo", "-pix_fmt", "rgba",
-        "-s", f"{W}x{H}", "-r", str(FPS), "-i", "pipe:0",
+        "-s", f"{OW}x{OH}", "-r", str(FPS), "-i", "pipe:0",
         "-i", audio_path,
-        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
+        "-vf", f"scale={W}:{H}:flags=neighbor",
+        "-c:v", "libx264", "-preset", "superfast", "-pix_fmt", "yuv420p",
+        "-threads", "2",
+        "-c:a", "aac", "-b:a", "128k",
         "-shortest", "-y", output_path,
     ]
     print(f"[RENDER] ffmpeg: {' '.join(ff_cmd)}")
@@ -389,101 +383,100 @@ def render_clip(
         bufsize=0,
     )
 
-    # Drain stderr in background so the pipe never blocks ffmpeg.
     stderr_chunks: list[bytes] = []
     def _pump_stderr() -> None:
         try:
             while True:
                 chunk = ff.stderr.read(4096)
-                if not chunk:
-                    break
+                if not chunk: break
                 stderr_chunks.append(chunk)
-        except Exception:
-            pass
+        except: pass
     t_err = threading.Thread(target=_pump_stderr, daemon=True)
     t_err.start()
 
-    pipe_error: Exception | None = None
-    last_frame = 0
-    # Cache composited frame bytes keyed by a quantized progress signature.
-    # Most frames are either "no annotations active" or "all active annotations
-    # fully drawn" — both produce identical pixels for long stretches. Caching
-    # avoids re-rasterizing SVG + alpha_composite every frame, which was the
-    # source of OOM-kill (rc=-9, BrokenPipe) on Railway.
+    # Tiny LRU cache for memory safety (512MB Railway limit)
     frame_cache: dict[tuple, bytes] = {}
-    MAX_CACHE = 48
+    MAX_CACHE = 8 
 
     def _sig(pm: dict[int, float]) -> tuple:
-        # Quantize to 2% steps so near-identical progress reuses cache
         return tuple(sorted((i, round(p * 50) / 50) for i, p in pm.items()))
 
     try:
+        last_frame = 0
         for f_idx in range(total_frames):
             last_frame = f_idx
+            if f_idx % 300 == 0:
+                gc.collect()
+
             t = f_idx / FPS
             prog_map: dict[int, float] = {}
             for i, ann in enumerate(annotations):
                 start = effective_start[i]
                 dur   = draw_durations[i]
-                if t < start:
-                    continue
+                if t < start: continue
                 elapsed = t - start
                 prog_map[i] = 1.0 if elapsed >= dur else _eased(elapsed / dur)
 
             if not prog_map:
-                ff.stdin.write(slide_bytes)
+                ff.stdin.write(slide_bytes_half)
                 continue
 
             key = _sig(prog_map)
-            cached = frame_cache.get(key)
-            if cached is not None:
-                ff.stdin.write(cached)
+            if key in frame_cache:
+                ff.stdin.write(frame_cache[key])
                 continue
 
             svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h, pen)
             if not svg:
-                frame_bytes = slide_bytes
+                frame_bytes = slide_bytes_half
             else:
                 png_bytes = cairosvg.svg2png(
                     bytestring=svg.encode(),
-                    output_width=W,
-                    output_height=H,
+                    output_width=OW,
+                    output_height=OH,
                 )
                 overlay = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-                frame = Image.alpha_composite(slide_rgba, overlay)
+                frame = Image.alpha_composite(slide_rgba_half, overlay)
                 frame_bytes = frame.tobytes()
                 overlay.close()
                 frame.close()
-                del overlay, frame, png_bytes
 
-            if len(frame_cache) < MAX_CACHE:
+            # Cache strategy: always cache "fully finished" states, otherwise use tiny LRU
+            is_full = all(p == 1.0 for p in prog_map.values())
+            if is_full or len(frame_cache) < MAX_CACHE:
+                if len(frame_cache) >= MAX_CACHE and not is_full:
+                    # Evict first non-full key
+                    non_full_keys = [k for k in frame_cache if k and not all(p == 1.0 for _, p in k)]
+                    if non_full_keys:
+                        del frame_cache[non_full_keys[0]]
+                    else:
+                        frame_cache.popitem()
                 frame_cache[key] = frame_bytes
+            
             ff.stdin.write(frame_bytes)
-    except (BrokenPipeError, ValueError, OSError) as pipe_err:
-        pipe_error = pipe_err
-        print(f"[RENDER] pipe write failed at frame {last_frame}/{total_frames}: {pipe_err!r}")
 
-    try:
         ff.stdin.close()
-    except Exception:
-        pass
+        ff.wait()
+    except Exception as e:
+        print(f"[RENDER] error at frame {last_frame}: {e}")
+        if ff.poll() is None:
+            ff.kill()
+        raise e
+    finally:
+        if ff.poll() is None:
+            try: ff.stdin.close()
+            except: pass
+            ff.wait()
+        
+        slide_rgba.close()
+        slide_rgba_half.close()
+        frame_cache.clear()
+        gc.collect()
 
-    try:
-        rc = ff.wait(timeout=300)
-    except subprocess.TimeoutExpired:
-        ff.kill()
-        rc = ff.wait()
-        stderr_chunks.append(b"\n<ffmpeg killed: wait timed out>")
+    if ff.returncode != 0:
+        err_out = b"".join(stderr_chunks).decode(errors="replace")
+        print(f"[RENDER] ffmpeg failed rc={ff.returncode}\n{err_out}")
+        raise RuntimeError(f"ffmpeg failed: {ff.returncode}")
 
-    t_err.join(timeout=5)
-    ff_err = b"".join(stderr_chunks)[-2000:].decode(errors="replace")
-
-    if pipe_error is not None or rc != 0:
-        raise RuntimeError(
-            f"ffmpeg failed (rc={rc}, frame={last_frame}/{total_frames}, "
-            f"pipe_error={pipe_error!r}); stderr: {ff_err or '<empty>'}"
-        )
-
-
-    print(f"[RENDER] done → {output_path}")
+    print(f"[RENDER] done: {output_path}")
     return audio_dur
