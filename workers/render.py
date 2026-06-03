@@ -46,7 +46,7 @@ DRAW_SECONDS = {
 # ── Coordinate transform (OCR source → 1920×1080) ───────────────────────────
 
 def _scale_bbox(
-    bbox: list[int],
+    bbox: Any,
     src_w: int,
     src_h: int,
 ) -> tuple[int, int, int, int]:
@@ -54,12 +54,17 @@ def _scale_bbox(
     scale   = min(W / src_w, H / src_h)
     off_x   = (W - src_w * scale) / 2
     off_y   = (H - src_h * scale) / 2
-    x, y, w, h = bbox
+
+    if isinstance(bbox, dict):
+        bx, by, bw, bh = bbox.get("x", 0), bbox.get("y", 0), bbox.get("w", 0), bbox.get("h", 0)
+    else:
+        bx, by, bw, bh = bbox
+
     return (
-        round(x * scale + off_x),
-        round(y * scale + off_y),
-        round(w * scale),
-        round(h * scale),
+        round(bx * scale + off_x),
+        round(by * scale + off_y),
+        round(bw * scale),
+        round(bh * scale),
     )
 
 
