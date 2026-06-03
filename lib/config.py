@@ -17,7 +17,6 @@ class Config:
     SUPABASE_URL:              str = _require("SUPABASE_URL")
     SUPABASE_SERVICE_ROLE_KEY: str = _require("SUPABASE_SERVICE_ROLE_KEY")
     OPENAI_API_KEY:            str = _require("OPENAI_API_KEY")
-    ELEVENLABS_API_KEY:        str = os.environ.get("ELEVENLABS_API_KEY", "")
     PORT:                      int = int(os.environ.get("PORT", "8000"))
 
 
