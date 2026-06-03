@@ -1,4 +1,4 @@
-# Updated: 2026-06-03 17:35
+# Updated: 2026-06-03 18:50 - Add key check
 """
 workers/ai_annotations.py — GPT-4o generates annotation events.
 
@@ -86,6 +86,9 @@ def generate_annotations(
     chunk_text: str,
     chunk_number: int,
 ) -> list[dict[str, Any]]:
+    if not config.OPENAI_API_KEY or len(config.OPENAI_API_KEY) < 20:
+        raise ValueError(f"Invalid OPENAI_API_KEY: '{config.OPENAI_API_KEY[:5]}...' (len={len(config.OPENAI_API_KEY)})")
+
     """
     Call GPT-4o to generate annotation events.
 
