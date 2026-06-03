@@ -3,7 +3,7 @@ workers/ai_annotations.py — GPT-4o generates annotation events.
 
 Each annotation:
   {
-    "type":        "underline" | "double_underline" | "circle" | "box" | "arrow",
+    "type":        "underline" | "circle",
     "start_time":  float   (seconds, synced to when the word is spoken),
     "target_text": str     (word/phrase from OCR),
     "bbox":        [x, y, w, h]  (OCR pixel coordinates),
@@ -28,17 +28,14 @@ Given:
 
 Your job: pick the 3–8 MOST IMPORTANT words or phrases and decide how to annotate them.
 
-ANNOTATION TYPES (pick intentionally — vary them):
-  underline        → important phrases or sub-headings
-  double_underline → the SINGLE main heading of the slide (use at most ONCE)
-  circle           → a key term, number, or single word to spotlight
-  box              → a statistic, formula, or group of words to frame
-  arrow            → a concept being introduced or a list item
+ANNOTATION TYPES:
+  underline → use for ~60% of annotations (phrases or sub-headings)
+  circle    → use for ~40% of annotations (key terms or single words)
 
 RULES:
 1. Generate 3–8 annotations. Quality over quantity.
-2. Use double_underline at most once — reserve for the main heading.
-3. Vary types — never use the same type more than 3 times.
+2. ONLY use "underline" and "circle" types.
+3. Distribution: Aim for 60% underlines and 40% circles across the chunk.
 4. start_time MUST match when that word is spoken (use the timestamps).
 5. bbox MUST come from the OCR data — never invent coordinates.
 6. target_text must match OCR text exactly.
@@ -106,7 +103,7 @@ Generate 3–8 annotations. Return JSON only."""
         annotations = []
 
     # Sanitise
-    allowed_types = {"underline", "double_underline", "circle", "box", "arrow"}
+    allowed_types = {"underline", "circle"}
     clean = []
     for ann in annotations:
         t = ann.get("type")
