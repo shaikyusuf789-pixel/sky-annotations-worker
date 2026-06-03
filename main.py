@@ -1,4 +1,4 @@
-# Updated: 2026-06-03 17:35
+# Updated: 2026-06-03 17:42 - Force Redeploy
 """
 main.py — FastAPI application for sky-annotations-worker.
 
