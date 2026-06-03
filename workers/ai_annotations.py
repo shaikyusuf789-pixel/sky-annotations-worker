@@ -119,16 +119,21 @@ def generate_annotations(
 
 Generate 3–8 annotations. Return JSON only."""
 
-    response = _openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
-        ],
-        response_format=_ANNOTATION_RESPONSE_FORMAT,
-        max_tokens=1500,
-        temperature=0.2,
-    )
+    try:
+        response = _openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            response_format=_ANNOTATION_RESPONSE_FORMAT,
+            max_tokens=1500,
+            temperature=0.2,
+        )
+    except Exception as e:
+        print(f"[AI] OpenAI error: {e}")
+        raise RuntimeError(f"OpenAI error: {str(e)}")
+
 
     raw = response.choices[0].message.content or "{}"
     try:
