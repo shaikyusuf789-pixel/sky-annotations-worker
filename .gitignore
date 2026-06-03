@@ -1,1 +1,15 @@
+.env
 __pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+/tmp/
+*.mp4
+*.mp3
+*.png
+*.jpg

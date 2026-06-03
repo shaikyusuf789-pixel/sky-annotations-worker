@@ -1,4 +1,5 @@
 # Updated: 2026-06-03 19:15 - Removed AI Annotation routes
+# Railway redeploy trigger: 2026-06-03 21:31 UTC
 """
 main.py — FastAPI application for sky-annotations-worker.
 
