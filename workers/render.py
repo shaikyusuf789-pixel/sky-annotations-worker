@@ -29,7 +29,11 @@ W, H, FPS = 1920, 1080, 30
 # Annotations start drawing this many seconds BEFORE the spoken word so the
 # visual lands in sync with the voice (compensates for ElevenLabs alignment
 # bias + human perception lag). Override via env if needed.
-ANNOTATION_LEAD = float(os.environ.get("ANNOTATION_LEAD_SECONDS", "1.1"))
+ANNOTATION_LEAD = float(os.environ.get("ANNOTATION_LEAD_SECONDS", "0.8"))
+# Minimum gap between the END of one annotation's draw animation and the
+# START of the next, so the tutor visually "lifts the pen" before the next
+# stroke. Prevents two circles/underlines being drawn simultaneously.
+ANNOTATION_PEN_LIFT = float(os.environ.get("ANNOTATION_PEN_LIFT", "0.08"))
 
 
 # Single-pen mode: ONE color per clip, chosen from slide background brightness.
@@ -339,6 +343,28 @@ def render_clip(
         for ann in annotations
     ]
 
+    # ── Serialize annotation visual starts (pen-lift) ──────────────────────
+    # A real tutor only draws one stroke at a time. We pre-compute the
+    # effective on-screen start for each annotation by chronological order:
+    # if its scheduled start would overlap the previous stroke's animation,
+    # push it to (prev_effective_start + prev_draw_duration + PEN_LIFT).
+    # Only the visual draw is serialized — original ordering / spoken-word
+    # anchors are otherwise preserved.
+    order = sorted(
+        range(len(annotations)),
+        key=lambda i: float(annotations[i].get("start_time") or 0),
+    )
+    effective_start: list[float] = [0.0] * len(annotations)
+    prev_end = -1e9
+    for i in order:
+        scheduled = float(annotations[i].get("start_time") or 0) - ANNOTATION_LEAD
+        if scheduled < 0:
+            scheduled = 0.0
+        start = max(scheduled, prev_end + ANNOTATION_PEN_LIFT)
+        effective_start[i] = start
+        prev_end = start + draw_durations[i]
+
+
     # Start FFmpeg in a 2-pass-friendly way: write raw frames to a temp file
     # first (avoids pipe-buffer/encoder back-pressure issues that have been
     # causing "flush of closed file" errors), then encode in one shot.
@@ -397,9 +423,7 @@ def render_clip(
             t = f_idx / FPS
             prog_map: dict[int, float] = {}
             for i, ann in enumerate(annotations):
-                start = float(ann.get("start_time") or 0) - ANNOTATION_LEAD
-                if start < 0:
-                    start = 0.0
+                start = effective_start[i]
                 dur   = draw_durations[i]
                 if t < start:
                     continue
