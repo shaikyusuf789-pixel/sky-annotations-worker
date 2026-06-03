@@ -43,50 +43,41 @@ OUTPUT FORMAT — return ONLY valid JSON:
 {"annotations": [{"type": "underline", "start_time": 0.0, "target_text": "sample", "bbox": [0,0,10,10]}, {"type": "circle", "start_time": 1.0, "target_text": "test", "bbox": [20,20,5,5]}]}"""
 
 
-def _rebalance_annotation_types(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Hard guarantee: only underline/circle, roughly 60/40 split."""
-    if not annotations:
-        return annotations
-
-    total = len(annotations)
-    target_circles = round(total * 0.4)
-
-    normalised = []
-    for ann in annotations:
-        ann_type = ann.get("type")
-        if ann_type not in {"underline", "circle"}:
-            ann_type = "underline"
-        normalised.append({**ann, "type": ann_type})
-
-    circle_count = sum(1 for ann in normalised if ann["type"] == "circle")
-    if circle_count < target_circles:
-        underline_indexes = [
-            idx for idx, ann in enumerate(normalised)
-            if ann["type"] == "underline"
-        ]
-        underline_indexes.sort(
-            key=lambda idx: (
-                len(str(normalised[idx].get("target_text", "")).split()),
-                idx,
-            )
-        )
-        for idx in underline_indexes[:target_circles - circle_count]:
-            normalised[idx]["type"] = "circle"
-    elif circle_count > target_circles:
-        circle_indexes = [
-            idx for idx, ann in enumerate(normalised)
-            if ann["type"] == "circle"
-        ]
-        circle_indexes.sort(
-            key=lambda idx: (
-                -len(str(normalised[idx].get("target_text", "")).split()),
-                idx,
-            )
-        )
-        for idx in circle_indexes[:circle_count - target_circles]:
-            normalised[idx]["type"] = "underline"
-
-    return normalised
+_ANNOTATION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "slide_annotations",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "annotations": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "type": {"type": "string", "enum": ["underline", "circle"]},
+                            "start_time": {"type": "number"},
+                            "target_text": {"type": "string"},
+                            "bbox": {
+                                "type": "array",
+                                "minItems": 4,
+                                "maxItems": 4,
+                                "items": {"type": "integer"},
+                            },
+                        },
+                        "required": ["type", "start_time", "target_text", "bbox"],
+                    },
+                }
+            },
+            "required": ["annotations"],
+        },
+    },
+}
 
 
 def generate_annotations(
@@ -131,7 +122,7 @@ Generate 3–8 annotations. Return JSON only."""
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user",   "content": user_prompt},
         ],
-        response_format={"type": "json_object"},
+        response_format=_ANNOTATION_RESPONSE_FORMAT,
         max_tokens=1500,
         temperature=0.2,
     )
@@ -147,13 +138,9 @@ Generate 3–8 annotations. Return JSON only."""
     if not isinstance(annotations, list):
         annotations = []
 
-    # Sanitise
-    allowed_types = {"underline", "circle"}
     clean = []
     for ann in annotations:
         t = ann.get("type")
-        if t not in allowed_types:
-            t = "circle" if len(clean) % 5 in (2, 4) else "underline"
         bbox = ann.get("bbox")
         if not isinstance(bbox, list) or len(bbox) != 4:
             continue
@@ -163,8 +150,6 @@ Generate 3–8 annotations. Return JSON only."""
             "target_text": str(ann.get("target_text") or ""),
             "bbox":        [int(v) for v in bbox],
         })
-
-    clean = _rebalance_annotation_types(clean)
 
     print(f"[AI] {len(clean)} annotations generated")
     return clean
