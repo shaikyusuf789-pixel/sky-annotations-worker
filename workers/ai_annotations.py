@@ -18,7 +18,9 @@ from typing import Any
 from openai import OpenAI
 from lib.config import config
 
-_openai = OpenAI(api_key=config.OPENAI_API_KEY)
+def _get_openai_client():
+    return OpenAI(api_key=config.OPENAI_API_KEY)
+
 
 _SYSTEM_PROMPT = """You are a video annotation assistant for English educational slides.
 
@@ -120,7 +122,7 @@ def generate_annotations(
 Generate 3–8 annotations. Return JSON only."""
 
     try:
-        response = _openai.chat.completions.create(
+        response = _get_openai_client().chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
