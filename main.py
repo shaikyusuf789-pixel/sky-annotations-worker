@@ -1,5 +1,5 @@
-# Updated: 2026-06-03 19:15 - Removed AI Annotation routes
-# Railway redeploy trigger: 2026-06-03 21:31 UTC
+# Updated: 2026-06-03 21:48 - Fix "Too many open files" in render
+# Railway redeploy trigger: 2026-06-03 21:48 UTC
 """
 main.py — FastAPI application for sky-annotations-worker.
 
