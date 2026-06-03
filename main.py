@@ -204,7 +204,7 @@ def _update_clip_status(script_id: str, chunk_id: str, slide_source: str,
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "sky-annotations-worker"}
+    return {"ok": True, "service": "sky-annotations-worker", "version": "v1.0.1-strict-types"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
