@@ -133,13 +133,22 @@ def _upsert_timestamps(script_id: str, chunk_id: str, chunk_number: int,
 
 def _upsert_ai(script_id: str, chunk_id: str, chunk_number: int,
                slide_source: str, annotations: list[dict]) -> None:
+    safe_annotations = []
+    for idx, ann in enumerate(annotations):
+        safe = dict(ann)
+        ann_type = safe.get("type")
+        if ann_type not in {"underline", "circle"}:
+            ann_type = "circle" if idx % 5 in (2, 4) else "underline"
+        safe["type"] = ann_type
+        safe_annotations.append(safe)
+
     get_supabase().table("clip_annotations").upsert(
         {
             "script_id":    script_id,
             "chunk_id":     chunk_id,
             "chunk_number": chunk_number,
             "slide_source": slide_source,
-            "annotations":  json.dumps(annotations),
+            "annotations":  json.dumps(safe_annotations),
         },
         on_conflict="script_id,chunk_id,slide_source",
     ).execute()
