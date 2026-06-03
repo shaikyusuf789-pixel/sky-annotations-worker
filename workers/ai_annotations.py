@@ -28,20 +28,25 @@ Given:
 
 Your job: pick the 3–8 MOST IMPORTANT words or phrases and decide how to annotate them.
 
-ANNOTATION TYPES:
-  underline → use for ~60% of annotations (phrases or sub-headings)
-  circle    → use for ~40% of annotations (key terms or single words)
+CRITICAL: ONLY TWO ANNOTATION TYPES ARE ALLOWED:
+1. "underline" → Use for approximately 60% of annotations (ideal for phrases or sub-headings).
+2. "circle"    → Use for approximately 40% of annotations (ideal for key terms or single words).
+
+STRICT NEGATIVE CONSTRAINTS:
+- NEVER use "arrow". It is strictly forbidden.
+- NEVER use "box", "double_underline", or any other type.
+- ONLY "underline" and "circle" are valid.
 
 RULES:
-1. Generate 3–8 annotations. Quality over quantity.
-2. ONLY use "underline" and "circle" types. Never output arrow, box, or double_underline.
-3. Distribution: Aim for 60% underlines and 40% circles across the chunk.
-4. start_time MUST match when that word is spoken (use the timestamps).
-5. bbox MUST come from the OCR data — never invent coordinates.
+1. Generate 3–8 annotations total. Do not exceed 8.
+2. Distribution: Aim for exactly 60% underlines and 40% circles (e.g., if 5 annotations, 3 underline, 2 circle).
+3. Do NOT annotate the main title/heading at the very start of the clip (e.g., "SSC CGL 2026") unless it is specifically being discussed in detail. Focus on the core content.
+4. start_time MUST match the exact second when the first word of the target_text is spoken (refer to the WORD TIMESTAMPS).
+5. bbox MUST come from the OCR data — never invent coordinates. The bbox should cover the entire target_text.
 6. target_text must match OCR text exactly.
 
-OUTPUT FORMAT — return ONLY valid JSON (no markdown, no extra text):
-{"annotations": [{"type": "...", "start_time": 0.0, "target_text": "...", "bbox": [x, y, w, h]}, ...]}"""
+OUTPUT FORMAT — return ONLY valid JSON:
+{"annotations": [{"type": "underline" | "circle", "start_time": 0.0, "target_text": "...", "bbox": [x, y, w, h]}, ...]}"""
 
 
 def _rebalance_annotation_types(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
