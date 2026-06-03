@@ -1,3 +1,4 @@
+# Updated: 2026-06-03 17:35
 """
 workers/ai_annotations.py — GPT-4o generates annotation events.
 
@@ -21,16 +22,9 @@ _openai = OpenAI(api_key=config.OPENAI_API_KEY)
 
 _SYSTEM_PROMPT = """You are a video annotation assistant for English educational slides.
 
-Given:
-- OCR words with pixel bounding boxes from a slide image
-- Word-level audio timestamps (when each word is spoken)
-- The script text for this segment
-
-Your job: pick the 3–8 MOST IMPORTANT words or phrases and decide how to annotate them.
-
 CRITICAL: ONLY TWO ANNOTATION TYPES ARE ALLOWED:
-1. "underline" → Use for approximately 60% of annotations (ideal for phrases or sub-headings).
-2. "circle"    → Use for approximately 40% of annotations (ideal for key terms or single words).
+1. "underline" → Use for approximately 60% of annotations.
+2. "circle"    → Use for approximately 40% of annotations.
 
 STRICT NEGATIVE CONSTRAINTS:
 - NEVER use "arrow". It is strictly forbidden.
@@ -39,14 +33,14 @@ STRICT NEGATIVE CONSTRAINTS:
 
 RULES:
 1. Generate 3–8 annotations total. Do not exceed 8.
-2. Distribution: Aim for exactly 60% underlines and 40% circles (e.g., if 5 annotations, 3 underline, 2 circle).
-3. Do NOT annotate the main title/heading at the very start of the clip (e.g., "SSC CGL 2026") unless it is specifically being discussed in detail. Focus on the core content.
-4. start_time MUST match the exact second when the first word of the target_text is spoken (refer to the WORD TIMESTAMPS).
-5. bbox MUST come from the OCR data — never invent coordinates. The bbox should cover the entire target_text.
+2. Distribution: Aim for exactly 60% underlines and 40% circles.
+3. Do NOT annotate the main title/heading at the very start of the clip (e.g., "SSC CGL 2026"). Focus on the core content.
+4. start_time MUST match the exact second when the first word of the target_text is spoken.
+5. bbox MUST come from the OCR data.
 6. target_text must match OCR text exactly.
 
 OUTPUT FORMAT — return ONLY valid JSON:
-{"annotations": [{"type": "underline" | "circle", "start_time": 0.0, "target_text": "...", "bbox": [x, y, w, h]}, ...]}"""
+{"annotations": [{"type": "underline", "start_time": 0.0, "target_text": "sample", "bbox": [0,0,10,10]}, {"type": "circle", "start_time": 1.0, "target_text": "test", "bbox": [20,20,5,5]}]}"""
 
 
 def _rebalance_annotation_types(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
