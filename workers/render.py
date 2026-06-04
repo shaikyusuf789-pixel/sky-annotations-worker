@@ -217,7 +217,7 @@ def render_clip(
     # Start ffmpeg
     ff = subprocess.Popen(
         [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "ffmpeg", "-hide_banner",
             "-f", "rawvideo", "-pix_fmt", "rgba",
             "-s", f"{W}x{H}", "-r", str(FPS), "-i", "pipe:0",
             "-i", audio_path,
@@ -234,6 +234,9 @@ def render_clip(
 
     try:
         for f_idx in range(total_frames):
+            if ff.poll() is not None:
+                break   # ffmpeg died early — stop writing frames
+
             t = f_idx / FPS
 
             # Quantized progress signature per annotation
@@ -290,7 +293,7 @@ def render_clip(
                 frame_cache[sig] = frame_bytes
             ff.stdin.write(frame_bytes)
 
-    except BrokenPipeError:
+    except (BrokenPipeError, ValueError, OSError):
         pass
     finally:
         try:
@@ -302,7 +305,7 @@ def render_clip(
     _, stderr_data = ff.communicate()
     if ff.returncode != 0:
         raise RuntimeError(
-            f"ffmpeg exited {ff.returncode}: "
+            f"ffmpeg failed (exit {ff.returncode}): "
             + stderr_data[-2000:].decode(errors="replace")
         )
 
