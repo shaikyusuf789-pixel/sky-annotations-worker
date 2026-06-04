@@ -1,14 +1,17 @@
-# Updated: 2026-06-03 18:50 - Add key check
+# Updated: 2026-06-04 - Programmatic start_time lookup (GPT was guessing wrong)
 """
 workers/ai_annotations.py — GPT-4o generates annotation events.
 
 Each annotation:
   {
     "type":        "underline" | "circle",
-    "start_time":  float   (seconds, synced to when the word is spoken),
+    "start_time":  float   (seconds, resolved programmatically from ts_words),
     "target_text": str     (word/phrase from OCR),
     "bbox":        [x, y, w, h]  (OCR pixel coordinates),
   }
+
+GPT is NOT asked for start_time — it was consistently wrong.
+start_time is resolved here by fuzzy-matching target_text against ts_words.
 """
 
 import json
@@ -35,14 +38,15 @@ STRICT NEGATIVE CONSTRAINTS:
 
 RULES:
 1. Generate 3–8 annotations total. Do not exceed 8.
-2. Distribution: Aim for exactly 60% underlines and 40% circles.
-3. Do NOT annotate the main title/heading at the very start of the clip (e.g., "SSC CGL 2026"). Focus on the core content.
-4. start_time MUST match the exact second when the first word of the target_text is spoken.
-5. bbox MUST come from the OCR data.
-6. target_text must match OCR text exactly.
+2. Distribution: Aim for 60% underlines and 40% circles (round to nearest whole number).
+3. Do NOT annotate the main title/heading at the very start of the clip. Focus on core content.
+4. bbox MUST come from the OCR data provided.
+5. target_text must be the English word or phrase visible on the slide (from OCR).
+
+DO NOT include start_time — it will be computed automatically.
 
 OUTPUT FORMAT — return ONLY valid JSON:
-{"annotations": [{"type": "underline", "start_time": 0.0, "target_text": "sample", "bbox": [0,0,10,10]}, {"type": "circle", "start_time": 1.0, "target_text": "test", "bbox": [20,20,5,5]}]}"""
+{"annotations": [{"type": "underline", "target_text": "sample", "bbox": [0,0,10,10]}, {"type": "circle", "target_text": "test", "bbox": [20,20,5,5]}]}"""
 
 
 _ANNOTATION_RESPONSE_FORMAT = {
@@ -63,7 +67,6 @@ _ANNOTATION_RESPONSE_FORMAT = {
                         "additionalProperties": False,
                         "properties": {
                             "type": {"type": "string", "enum": ["underline", "circle"]},
-                            "start_time": {"type": "number"},
                             "target_text": {"type": "string"},
                             "bbox": {
                                 "type": "array",
@@ -72,7 +75,7 @@ _ANNOTATION_RESPONSE_FORMAT = {
                                 "items": {"type": "integer"},
                             },
                         },
-                        "required": ["type", "start_time", "target_text", "bbox"],
+                        "required": ["type", "target_text", "bbox"],
                     },
                 }
             },
@@ -82,31 +85,51 @@ _ANNOTATION_RESPONSE_FORMAT = {
 }
 
 
+def _find_start_time(target_text: str, ts_words: list[dict]) -> float:
+    """
+    Fuzzy-match target_text (English phrase) against the word timestamps list.
+    Tries each word in target_text against each ts entry (case-insensitive prefix match).
+    Returns the earliest matching timestamp, or 0.5s if nothing matches.
+    """
+    if not ts_words:
+        return 0.5
+
+    target_words = [w.lower().strip(".,!?;:\"'") for w in target_text.split()]
+
+    best_time = None
+    for tw in target_words:
+        if len(tw) < 2:
+            continue
+        for entry in ts_words:
+            ew = (entry.get("word") or "").lower().strip(".,!?;:\"'")
+            # prefix match in either direction (handles "joule"/"Joule", "pH"/"ph", etc.)
+            if ew.startswith(tw) or tw.startswith(ew):
+                t = float(entry.get("start") or 0)
+                if best_time is None or t < best_time:
+                    best_time = t
+
+    if best_time is None:
+        # fallback: spread evenly — use annotation index offset from audio midpoint
+        total = ts_words[-1]["end"] if ts_words else 10.0
+        best_time = total * 0.1
+
+    return best_time
+
+
 def generate_annotations(
     ocr_words: list[dict],
     ts_words: list[dict],
     chunk_text: str,
     chunk_number: int,
 ) -> list[dict[str, Any]]:
-    print(f"[DEBUG] OPENAI_API_KEY value: '{config.OPENAI_API_KEY}'")
     if not config.OPENAI_API_KEY or len(config.OPENAI_API_KEY) < 20:
         raise ValueError(f"Invalid OPENAI_API_KEY format (len={len(config.OPENAI_API_KEY)})")
 
-
-    """
-    Call GPT-4o to generate annotation events.
-
-    Returns list of annotation dicts.
-    """
     print(f"[AI] generating annotations for chunk {chunk_number}")
 
     ocr_lines = "\n".join(
         f'  "{w["text"]}" → bbox:[{w["x"]},{w["y"]},{w["w"]},{w["h"]}]'
         for w in ocr_words
-    )
-    ts_lines = "\n".join(
-        f'  {w["start"]:.2f}s–{w["end"]:.2f}s  "{w["word"]}"'
-        for w in ts_words
     )
     total_dur = ts_words[-1]["end"] if ts_words else 10.0
 
@@ -115,13 +138,11 @@ def generate_annotations(
 === SCRIPT TEXT ===
 {chunk_text}
 
-=== OCR WORDS (text + bounding boxes) ===
+=== OCR WORDS on slide (text + bounding boxes) ===
 {ocr_lines}
 
-=== WORD TIMESTAMPS ===
-{ts_lines}
-
-Generate 3–8 annotations. Return JSON only."""
+Pick 3–8 key terms from the OCR words above that are important for the student.
+Return ONLY type, target_text, and bbox — no start_time needed."""
 
     try:
         response = _get_openai_client().chat.completions.create(
@@ -131,13 +152,12 @@ Generate 3–8 annotations. Return JSON only."""
                 {"role": "user",   "content": user_prompt},
             ],
             response_format=_ANNOTATION_RESPONSE_FORMAT,
-            max_tokens=1500,
+            max_tokens=1000,
             temperature=0.2,
         )
     except Exception as e:
         print(f"[AI] OpenAI error: {e}")
         raise RuntimeError(f"OpenAI error: {str(e)}")
-
 
     raw = response.choices[0].message.content or "{}"
     try:
@@ -156,12 +176,15 @@ Generate 3–8 annotations. Return JSON only."""
         bbox = ann.get("bbox")
         if not isinstance(bbox, list) or len(bbox) != 4:
             continue
+        target = str(ann.get("target_text") or "")
+        start_time = _find_start_time(target, ts_words)
         clean.append({
             "type":        t,
-            "start_time":  max(0.0, float(ann.get("start_time") or 0)),
-            "target_text": str(ann.get("target_text") or ""),
+            "start_time":  start_time,
+            "target_text": target,
             "bbox":        [int(v) for v in bbox],
         })
+        print(f"[AI]   {t:10s} '{target}' → start={start_time:.2f}s  bbox={bbox}")
 
-    print(f"[AI] {len(clean)} annotations generated")
+    print(f"[AI] {len(clean)} annotations generated for chunk {chunk_number}")
     return clean
