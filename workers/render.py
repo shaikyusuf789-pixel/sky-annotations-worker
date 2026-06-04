@@ -1,24 +1,21 @@
 """
 workers/render.py — FFmpeg clip renderer with per-frame Pillow + CairoSVG compositing.
 
+Based on the original Replit render.py, hardened for long videos:
+  • Frame-state caching (quantized progress) avoids re-rasterizing identical frames
+  • All PIL Image objects are explicitly closed (no "Too many open files")
+  • Robust ffmpeg pipe handling (BrokenPipe → surfaces stderr)
+  • Supports bbox as list [x,y,w,h] OR dict {x,y,w,h}
+
 Pipeline:
   1. Resize slide PNG to 1920×1080 (letterboxed, black bars)
   2. For each frame at 30fps, composite active annotation SVG strokes onto the slide
   3. Pipe raw RGBA frames into FFmpeg → MP4 (libx264 + AAC)
-
-Annotation colors:
-  underline        → #3b82f6
-  double_underline → #0ea5e9
-  circle           → #f59e0b
-  box              → #10b981
-  arrow            → #8b5cf6
 """
 
 import io
 import math
 import subprocess
-import tempfile
-import os
 from typing import Any
 
 import cairosvg
@@ -42,21 +39,22 @@ DRAW_SECONDS = {
     "arrow":             1.2,
 }
 
+# Quantize per-annotation progress to this many steps so frames with
+# the same visual state can be cached and reused.
+PROG_STEPS = 40
+
 
 # ── Coordinate transform (OCR source → 1920×1080) ───────────────────────────
 
-def _scale_bbox(
-    bbox: Any,
-    src_w: int,
-    src_h: int,
-) -> tuple[int, int, int, int]:
-    """Scale OCR bbox from source image dimensions to 1920×1080 letterboxed space."""
-    scale   = min(W / src_w, H / src_h)
-    off_x   = (W - src_w * scale) / 2
-    off_y   = (H - src_h * scale) / 2
+def _scale_bbox(bbox: Any, src_w: int, src_h: int) -> tuple[int, int, int, int]:
+    scale = min(W / src_w, H / src_h)
+    off_x = (W - src_w * scale) / 2
+    off_y = (H - src_h * scale) / 2
 
     if isinstance(bbox, dict):
-        bx, by, bw, bh = bbox.get("x", 0), bbox.get("y", 0), bbox.get("w", 0), bbox.get("h", 0)
+        bx = bbox.get("x", 0); by = bbox.get("y", 0)
+        bw = bbox.get("w", bbox.get("width", 0))
+        bh = bbox.get("h", bbox.get("height", 0))
     else:
         bx, by, bw, bh = bbox
 
@@ -68,7 +66,7 @@ def _scale_bbox(
     )
 
 
-# ── SVG path builders ────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _eased(t: float) -> float:
     return t * t * (3 - 2 * t)
@@ -83,19 +81,20 @@ def _pts_to_path(pts: list[tuple[int, int]]) -> str:
     return d
 
 
-def _underline_pts(x: int, y_bottom: int, w: int) -> list[tuple[int, int]]:
+def _underline_pts(x, y_bottom, w):
     steps = max(20, w // 4)
     return [(x + w * i // steps, y_bottom + 4) for i in range(steps + 1)]
 
 
-def _double_underline_pts(x: int, y_bottom: int, w: int) -> list[list[tuple[int, int]]]:
+def _double_underline_pts(x, y_bottom, w):
     steps = max(20, w // 4)
-    line1 = [(x + w * i // steps, y_bottom + 4) for i in range(steps + 1)]
-    line2 = [(x + w * i // steps, y_bottom + 11) for i in range(steps + 1)]
-    return [line1, line2]
+    return [
+        [(x + w * i // steps, y_bottom + 4) for i in range(steps + 1)],
+        [(x + w * i // steps, y_bottom + 11) for i in range(steps + 1)],
+    ]
 
 
-def _circle_pts(cx: float, cy: float, rx: float, ry: float) -> list[tuple[int, int]]:
+def _circle_pts(cx, cy, rx, ry):
     return [
         (
             round(cx + rx * math.cos(-math.pi / 2 - 2.1 * math.pi * i / 89)),
@@ -105,96 +104,61 @@ def _circle_pts(cx: float, cy: float, rx: float, ry: float) -> list[tuple[int, i
     ]
 
 
-def _box_pts(x: int, y: int, w: int, h: int) -> list[tuple[int, int]]:
+def _box_pts(x, y, w, h):
     n = 20
     def side(x1, y1, x2, y2):
         return [(x1 + (x2 - x1) * i // n, y1 + (y2 - y1) * i // n) for i in range(n)]
-    return side(x, y, x+w, y) + side(x+w, y, x+w, y+h) + side(x+w, y+h, x, y+h) + side(x, y+h, x, y) + [(x, y)]
+    return (side(x, y, x+w, y) + side(x+w, y, x+w, y+h)
+            + side(x+w, y+h, x, y+h) + side(x, y+h, x, y) + [(x, y)])
 
 
-def _arrow_pts(x: int, y_mid: int) -> list[tuple[int, int]]:
+def _arrow_pts(x, y_mid):
     tip = x - 10
     return (
-        [(tip - 40 + i * 2, y_mid) for i in range(20)] +
-        [(tip - i * 8, y_mid - i * 8) for i in range(5)] +
-        [(tip - 40 + i * 8, y_mid - 40 + i * 8) for i in range(5)]
+        [(tip - 40 + i * 2, y_mid) for i in range(20)]
+        + [(tip - i * 8, y_mid - i * 8) for i in range(5)]
+        + [(tip - 40 + i * 8, y_mid - 40 + i * 8) for i in range(5)]
     )
 
 
-# ── Frame SVG builder ────────────────────────────────────────────────────────
+# ── SVG frame builder ────────────────────────────────────────────────────────
 
-def _build_frame_svg(
-    annotations: list[dict],
-    progress_map: dict[int, float],  # ann_index → 0.0–1.0
-    src_w: int,
-    src_h: int,
-) -> str:
+def _build_frame_svg(annotations, progress_map, src_w, src_h) -> str:
     paths_svg = []
-
     for idx, ann in enumerate(annotations):
         prog = progress_map.get(idx)
         if prog is None or prog <= 0:
             continue
-
         ann_type = ann["type"]
-        color    = STROKE_COLORS.get(ann_type, "#ffffff")
-        sw       = "8" if ann_type in ("circle", "box") else "6"
+        color = STROKE_COLORS.get(ann_type, "#ffffff")
+        sw = "8" if ann_type in ("circle", "box") else "6"
         x, y, w, h = _scale_bbox(ann["bbox"], src_w, src_h)
 
+        def add(pts, stroke_w=sw):
+            n = max(2, round(len(pts) * prog))
+            d = _pts_to_path(pts[:n])
+            paths_svg.append(
+                f'<path d="{d}" stroke="{color}" stroke-width="{stroke_w}" '
+                f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
+            )
+
         if ann_type == "underline":
-            pts  = _underline_pts(x, y + h, w)
-            n    = max(2, round(len(pts) * prog))
-            d    = _pts_to_path(pts[:n])
-            paths_svg.append(
-                f'<path d="{d}" stroke="{color}" stroke-width="{sw}" '
-                f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
-            )
-
+            add(_underline_pts(x, y + h, w))
         elif ann_type == "double_underline":
-            for line_pts in _double_underline_pts(x, y + h, w):
-                n  = max(2, round(len(line_pts) * prog))
-                d  = _pts_to_path(line_pts[:n])
-                paths_svg.append(
-                    f'<path d="{d}" stroke="{color}" stroke-width="6" '
-                    f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
-                )
-
+            for line in _double_underline_pts(x, y + h, w):
+                add(line, "6")
         elif ann_type == "circle":
-            cx, cy = x + w / 2, y + h / 2
-            rx, ry = w / 2 + 14, h / 2 + 12
-            pts  = _circle_pts(cx, cy, rx, ry)
-            n    = max(2, round(len(pts) * prog))
-            d    = _pts_to_path(pts[:n])
-            paths_svg.append(
-                f'<path d="{d}" stroke="{color}" stroke-width="{sw}" '
-                f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
-            )
-
+            add(_circle_pts(x + w / 2, y + h / 2, w / 2 + 14, h / 2 + 12))
         elif ann_type == "box":
-            pts = _box_pts(x - 6, y - 4, w + 12, h + 8)
-            n   = max(2, round(len(pts) * prog))
-            d   = _pts_to_path(pts[:n])
-            paths_svg.append(
-                f'<path d="{d}" stroke="{color}" stroke-width="{sw}" '
-                f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
-            )
-
+            add(_box_pts(x - 6, y - 4, w + 12, h + 8))
         elif ann_type == "arrow":
-            pts = _arrow_pts(x, y + h // 2)
-            n   = max(2, round(len(pts) * prog))
-            d   = _pts_to_path(pts[:n])
-            paths_svg.append(
-                f'<path d="{d}" stroke="{color}" stroke-width="{sw}" '
-                f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
-            )
+            add(_arrow_pts(x, y + h // 2))
 
     if not paths_svg:
         return ""
-
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">'
-        + "".join(paths_svg)
-        + "</svg>"
+        + "".join(paths_svg) + "</svg>"
     )
 
 
@@ -212,7 +176,7 @@ def get_audio_duration(path: str) -> float:
         return 30.0
 
 
-# ── Main render function ──────────────────────────────────────────────────────
+# ── Main render ───────────────────────────────────────────────────────────────
 
 def render_clip(
     slide_path: str,
@@ -222,86 +186,119 @@ def render_clip(
     ocr_src_w: int = 2400,
     ocr_src_h: int = 1350,
 ) -> float:
-    """
-    Render an annotated MP4 clip.
-
-    Returns the clip duration in seconds.
-
-    Parameters
-    ----------
-    slide_path   : local PNG path (any resolution — will be letterboxed to 1920×1080)
-    audio_path   : local MP3/AAC/WAV path
-    annotations  : list of annotation dicts (type, start_time, bbox, …)
-    output_path  : where to write the MP4
-    ocr_src_w/h  : resolution of the image OCR ran on (for correct bbox scaling)
-    """
-    audio_dur    = get_audio_duration(audio_path)
+    audio_dur = get_audio_duration(audio_path)
     total_frames = math.ceil(audio_dur * FPS)
-    print(f"[RENDER] {total_frames} frames @ {FPS}fps, duration={audio_dur:.2f}s")
+    print(f"[RENDER] {total_frames} frames @ {FPS}fps, dur={audio_dur:.2f}s, anns={len(annotations)}")
 
-    # Resize slide to 1920×1080 letterboxed (black bars)
+    # Load + letterbox slide once
     with Image.open(slide_path) as img:
         raw_slide = img.convert("RGBA")
-    bg = Image.new("RGBA", (W, H), (0, 0, 0, 255))
-    sw, sh = raw_slide.size
-    scale  = min(W / sw, H / sh)
-    nw, nh = round(sw * scale), round(sh * scale)
-    resized = raw_slide.resize((nw, nh), Image.LANCZOS)
-    bg.paste(resized, ((W - nw) // 2, (H - nh) // 2))
+    try:
+        bg = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+        sw, sh = raw_slide.size
+        scale = min(W / sw, H / sh)
+        nw, nh = round(sw * scale), round(sh * scale)
+        resized = raw_slide.resize((nw, nh), Image.LANCZOS)
+        try:
+            bg.paste(resized, ((W - nw) // 2, (H - nh) // 2))
+        finally:
+            resized.close()
+    finally:
+        raw_slide.close()
     slide_rgba = bg
-    slide_bytes = slide_rgba.tobytes()  # reuse for blank frames
+    slide_bytes = slide_rgba.tobytes()
 
-    # Per-annotation draw duration
     draw_durations = [
         max(0.5, float(ann.get("draw_duration") or DRAW_SECONDS.get(ann["type"], 1.5)))
         for ann in annotations
     ]
+    start_times = [float(ann.get("start_time") or 0) for ann in annotations]
 
-    # Start FFmpeg
+    # Start ffmpeg
     ff = subprocess.Popen(
         [
-            "ffmpeg",
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "rgba",
             "-s", f"{W}x{H}", "-r", str(FPS), "-i", "pipe:0",
             "-i", audio_path,
-            "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k",
             "-shortest", "-y", output_path,
         ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
 
-    for f_idx in range(total_frames):
-        t = f_idx / FPS
-        prog_map: dict[int, float] = {}
-        for i, ann in enumerate(annotations):
-            start = float(ann.get("start_time") or 0)
-            dur   = draw_durations[i]
-            if t < start:
-                continue
-            elapsed = t - start
-            prog_map[i] = 1.0 if elapsed >= dur else _eased(elapsed / dur)
+    # Frame cache: quantized progress tuple → rendered bytes
+    frame_cache: dict[tuple, bytes] = {}
+    MAX_CACHE = 256
 
-        if not prog_map:
-            ff.stdin.write(slide_bytes)
-        else:
+    try:
+        for f_idx in range(total_frames):
+            t = f_idx / FPS
+
+            # Quantized progress signature per annotation
+            sig_list = []
+            prog_map: dict[int, float] = {}
+            any_active = False
+            for i in range(len(annotations)):
+                start = start_times[i]
+                if t < start:
+                    sig_list.append(0)
+                    continue
+                elapsed = t - start
+                dur = draw_durations[i]
+                if elapsed >= dur:
+                    p = 1.0
+                else:
+                    p = _eased(elapsed / dur)
+                q = round(p * PROG_STEPS)
+                sig_list.append(q)
+                if q > 0:
+                    prog_map[i] = q / PROG_STEPS
+                    any_active = True
+
+            if not any_active:
+                ff.stdin.write(slide_bytes)
+                continue
+
+            sig = tuple(sig_list)
+            cached = frame_cache.get(sig)
+            if cached is not None:
+                ff.stdin.write(cached)
+                continue
+
             svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h)
-            if svg:
+            if not svg:
+                frame_bytes = slide_bytes
+            else:
                 png_bytes = cairosvg.svg2png(
                     bytestring=svg.encode(),
-                    output_width=W,
-                    output_height=H,
+                    output_width=W, output_height=H,
                 )
                 with Image.open(io.BytesIO(png_bytes)) as overlay_img:
                     overlay = overlay_img.convert("RGBA")
-                    frame   = Image.alpha_composite(slide_rgba, overlay)
-                ff.stdin.write(frame.tobytes())
-            else:
-                ff.stdin.write(slide_bytes)
+                try:
+                    composed = Image.alpha_composite(slide_rgba, overlay)
+                    try:
+                        frame_bytes = composed.tobytes()
+                    finally:
+                        composed.close()
+                finally:
+                    overlay.close()
 
-    ff.stdin.close()
+            if len(frame_cache) < MAX_CACHE:
+                frame_cache[sig] = frame_bytes
+            ff.stdin.write(frame_bytes)
+
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            ff.stdin.close()
+        except Exception:
+            pass
+        slide_rgba.close()
+
     _, stderr_data = ff.communicate()
     if ff.returncode != 0:
         raise RuntimeError(
