@@ -24,11 +24,11 @@ from PIL import Image
 W, H, FPS = 1280, 720, 24
 
 STROKE_COLORS = {
-    "underline":         "#3b82f6",
-    "double_underline":  "#0ea5e9",
-    "circle":            "#f59e0b",
-    "box":               "#10b981",
-    "arrow":             "#8b5cf6",
+    "underline":         "#ffffff",
+    "double_underline":  "#ffffff",
+    "circle":            "#ffffff",
+    "box":               "#ffffff",
+    "arrow":             "#ffffff",
 }
 
 # Base drawing durations
@@ -158,13 +158,11 @@ def _build_frame_svg(annotations, progress_map, src_w, src_h, default_color="#ff
         if prog is None or prog <= 0:
             continue
         ann_type = ann["type"]
-        # Use detection-based default color, but keep branded types if preferred 
-        # (Though black/white is safer for contrast)
-        color = STROKE_COLORS.get(ann_type, default_color)
-        if default_color == "#000000" and color == "#ffffff": # Safety for light mode
-             color = "#000000"
+        # User requested white pen always
+        color = "#ffffff"
 
-        sw = "8" if ann_type in ("circle", "box") else "6"
+        # Reduced stroke width to 70% of previous (8->5.6, 6->4.2)
+        sw = "5.6" if ann_type in ("circle", "box") else "4.2"
         x, y, w, h = _scale_bbox(ann["bbox"], src_w, src_h)
 
         def add(pts, stroke_w=sw):
@@ -241,10 +239,9 @@ def render_clip(
     slide_rgba = bg
     slide_bytes = slide_rgba.tobytes()
     
-    # Detect brightness for pen color
-    brightness = _get_image_brightness(slide_rgba)
-    default_pen_color = "#ffffff" if brightness == "dark" else "#000000"
-    print(f"[RENDER] slide brightness: {brightness}, using {default_pen_color} pen", flush=True)
+    # Pen color is now always white as per user request
+    default_pen_color = "#ffffff"
+    print(f"[RENDER] using white pen (always)", flush=True)
 
     # Calculate durations and ENFORCE SEQUENTIAL (One hand rule)
     draw_durations = []
