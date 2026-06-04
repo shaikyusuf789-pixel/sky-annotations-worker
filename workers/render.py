@@ -44,14 +44,25 @@ DRAW_SECONDS = {
 
 import random
 
-def _add_human_jitter(pts: list[tuple[int, int]], intensity: float = 1.5) -> list[tuple[int, int]]:
-    """Adds small random offsets to mimic shaky human hand."""
-    if not pts: return pts
-    return [
-        (round(x + random.uniform(-intensity, intensity)), 
-         round(y + random.uniform(-intensity, intensity)))
-        for x, y in pts
-    ]
+def _add_human_jitter(pts: list[tuple[int, int]], intensity: float = 1.0) -> list[tuple[int, int]]:
+    """Adds a coherent 'zigzag' wobble to mimic a human hand instead of random jitter."""
+    if not pts or len(pts) < 2: return pts
+    
+    # We use a simple coherent noise approach: a few sine waves with different frequencies
+    # but we'll use a local random for the 'seed' of this specific stroke
+    seed = random.uniform(0, 1000)
+    
+    new_pts = []
+    for i, (x, y) in enumerate(pts):
+        # Create a more organic "shaky hand" effect using overlapping sines
+        # This creates a "zigzag" that moves with the line rather than jumping randomly per point
+        off_x = (math.sin(i * 0.3 + seed) * 1.2 + 
+                 math.sin(i * 0.15 + seed * 1.2) * 0.8) * intensity
+        off_y = (math.cos(i * 0.25 + seed * 0.8) * 1.1 + 
+                 math.cos(i * 0.1 + seed * 1.5) * 0.7) * intensity
+        
+        new_pts.append((round(x + off_x), round(y + off_y)))
+    return new_pts
 
 def _get_image_brightness(img: Image.Image) -> str:
     """Returns 'light' or 'dark' based on perceived brightness."""
@@ -131,13 +142,10 @@ def _circle_pts(cx, cy, rx, ry):
 
 
 def _pen_pts(x, y_mid, w):
-    """White pen stroke through the vertical centre of the bbox — slight wobble."""
+    """White pen stroke through the vertical centre of the bbox — slight zigzag."""
     steps = max(20, w // 3)
-    wobble = [0, 1, 2, 1, 0, -1, -2, -1]
-    return [
-        (x + w * i // steps, y_mid + wobble[i % len(wobble)])
-        for i in range(steps + 1)
-    ]
+    pts = [(x + w * i // steps, y_mid) for i in range(steps + 1)]
+    return _add_human_jitter(pts, intensity=1.5)
 
 def _box_pts(x, y, w, h):
     n = 20
@@ -163,7 +171,7 @@ def _arrow_pts(x, y_mid):
 
 # ── SVG frame builder ────────────────────────────────────────────────────────
 
-def _build_frame_svg(annotations, progress_map, src_w, src_h, default_color="#ffffff") -> str:
+def _build_frame_svg(annotations, all_ann_pts, progress_map) -> str:
     paths_svg = []
     for idx, ann in enumerate(annotations):
         prog = progress_map.get(idx)
@@ -175,7 +183,10 @@ def _build_frame_svg(annotations, progress_map, src_w, src_h, default_color="#ff
 
         # Reduced stroke width to 70% of previous (8->5.6, 6->4.2)
         sw = "5.6" if ann_type in ("circle", "box") else "4.2"
-        x, y, w, h = _scale_bbox(ann["bbox"], src_w, src_h)
+        
+        pts_data = all_ann_pts[idx]
+        if not pts_data:
+            continue
 
         def add(pts, stroke_w=sw):
             n = max(2, round(len(pts) * prog))
@@ -185,19 +196,14 @@ def _build_frame_svg(annotations, progress_map, src_w, src_h, default_color="#ff
                 f'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
             )
 
-        if ann_type == "underline":
-            add(_underline_pts(x, y + h, w))
-        elif ann_type == "double_underline":
-            for line in _double_underline_pts(x, y + h, w):
-                add(line, "6")
-        elif ann_type == "circle":
-            add(_circle_pts(x + w / 2, y + h / 2, w / 2 + 14, h / 2 + 12))
-        elif ann_type == "box":
-            add(_box_pts(x - 6, y - 4, w + 12, h + 8))
+        if ann_type == "double_underline":
+            # pts_data is a list of two lines
+            for line in pts_data:
+                add(line, "4.2")
         elif ann_type == "pen":
-            add(_pen_pts(x, y + h // 2, w), "5")
-        elif ann_type == "arrow":
-            add(_arrow_pts(x, y + h // 2))
+            add(pts_data, "3.5") # 5 * 0.7 = 3.5
+        else:
+            add(pts_data)
 
     if not paths_svg:
         return ""
@@ -286,6 +292,26 @@ def render_clip(
     start_times = [adjusted_starts[i] for i in range(len(annotations))]
     draw_durations = [max(0.5, float(ann.get("draw_duration") or DRAW_SECONDS.get(ann["type"], 1.5))) for ann in annotations]
 
+    # Pre-generate all points for all annotations (FIXES GLITTER/SHINING)
+    all_ann_pts = []
+    for ann in annotations:
+        ann_type = ann["type"]
+        x, y, w, h = _scale_bbox(ann["bbox"], ocr_src_w, ocr_src_h)
+        
+        if ann_type == "underline":
+            all_ann_pts.append(_underline_pts(x, y + h, w))
+        elif ann_type == "double_underline":
+            all_ann_pts.append(_double_underline_pts(x, y + h, w))
+        elif ann_type == "circle":
+            all_ann_pts.append(_circle_pts(x + w / 2, y + h / 2, w / 2 + 14, h / 2 + 12))
+        elif ann_type == "box":
+            all_ann_pts.append(_box_pts(x - 6, y - 4, w + 12, h + 8))
+        elif ann_type == "pen":
+            all_ann_pts.append(_pen_pts(x, y + h // 2, w))
+        elif ann_type == "arrow":
+            all_ann_pts.append(_arrow_pts(x, y + h // 2))
+        else:
+            all_ann_pts.append(None)
 
     # Start ffmpeg
     ff = subprocess.Popen(
@@ -303,7 +329,7 @@ def render_clip(
 
     # Frame cache: quantized progress tuple → rendered bytes
     frame_cache: dict[tuple, bytes] = {}
-    MAX_CACHE = 256
+    MAX_CACHE = 512 # Increased cache size slightly
 
     try:
         for f_idx in range(total_frames):
@@ -343,7 +369,7 @@ def render_clip(
                 ff.stdin.write(cached)
                 continue
 
-            svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h, default_pen_color)
+            svg = _build_frame_svg(annotations, all_ann_pts, prog_map)
             if not svg:
                 frame_bytes = slide_bytes
             else:
