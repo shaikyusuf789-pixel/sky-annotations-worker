@@ -1,15 +1,14 @@
-# Updated: 2026-06-03 17:42 - Force Redeploy
+# Updated: 2026-06-04 - render.py rewritten with frame cache + leak fixes
+# Railway redeploy trigger: 2026-06-04
 """
 main.py — FastAPI application for sky-annotations-worker.
 
-All annotation pipeline routes:
+Pipeline routes:
   GET  /health
   POST /ocr/run
   POST /ocr/run-all
   POST /timestamps/run
   POST /timestamps/run-all
-  POST /ai/run
-  POST /ai/run-all
   POST /clips/render
   POST /clips/render-all
   GET  /slide-preview
@@ -36,8 +35,9 @@ from lib.storage import (
 )
 from workers.ocr import run_ocr
 from workers.timestamps import get_timestamps
-from workers.ai_annotations import generate_annotations
 from workers.render import render_clip, get_audio_duration
+from workers.merger import merge_script_clips
+
 
 import httpx
 
@@ -80,15 +80,6 @@ class TsRunReq(BaseModel):
 class TsRunAllReq(BaseModel):
     script_id: str
 
-class AiRunReq(BaseModel):
-    script_id:    str
-    chunk_id:     str
-    chunk_number: int
-    slide_source: str = "gamma"
-
-class AiRunAllReq(BaseModel):
-    script_id:    str
-    slide_source: str = "gamma"
 
 class RenderReq(BaseModel):
     script_id:    str
@@ -99,6 +90,11 @@ class RenderReq(BaseModel):
 class RenderAllReq(BaseModel):
     script_id:    str
     slide_source: str = "gamma"
+
+class MergeReq(BaseModel):
+    script_id:    str
+    slide_source: str = "gamma"
+
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -132,18 +128,6 @@ def _upsert_timestamps(script_id: str, chunk_id: str, chunk_number: int,
         on_conflict="script_id,chunk_id",
     ).execute()
 
-def _upsert_ai(script_id: str, chunk_id: str, chunk_number: int,
-               slide_source: str, annotations: list[dict]) -> None:
-    get_supabase().table("clip_annotations").upsert(
-        {
-            "script_id":    script_id,
-            "chunk_id":     chunk_id,
-            "chunk_number": chunk_number,
-            "slide_source": slide_source,
-            "annotations":  json.dumps(annotations),
-        },
-        on_conflict="script_id,chunk_id,slide_source",
-    ).execute()
 
 def _upsert_clip(script_id: str, chunk_id: str, chunk_number: int,
                  slide_source: str, status: str = "rendering",
@@ -176,11 +160,6 @@ def _get_ts(chunk_id: str) -> dict | None:
            .eq("chunk_id", chunk_id).limit(1).execute())
     return res.data[0] if res.data else None
 
-def _get_ai(chunk_id: str, slide_source: str) -> dict | None:
-    res = (get_supabase().table("clip_annotations").select("*")
-           .eq("chunk_id", chunk_id).eq("slide_source", slide_source)
-           .limit(1).execute())
-    return res.data[0] if res.data else None
 
 def _update_clip_status(script_id: str, chunk_id: str, slide_source: str,
                         **kwargs) -> None:
@@ -195,7 +174,7 @@ def _update_clip_status(script_id: str, chunk_id: str, slide_source: str,
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "sky-annotations-worker", "version": "v1.0.2-port-schema"}
+    return {"ok": True, "service": "sky-annotations-worker", "version": "v1.2.0-merge-active"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -292,72 +271,6 @@ def timestamps_run_all(req: TsRunAllReq, bg: BackgroundTasks):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# AI ANNOTATIONS ROUTES
-# ══════════════════════════════════════════════════════════════════════════════
-
-@app.post("/ai/run")
-def ai_run(req: AiRunReq):
-    try:
-        print(f"[AI/run] chunk {req.chunk_number} ({req.chunk_id})")
-        ocr_row = _get_ocr(req.chunk_id, req.slide_source)
-        ts_row  = _get_ts(req.chunk_id)
-        if not ocr_row or not ts_row:
-            raise HTTPException(status_code=400, detail="OCR and Timestamps are both required before AI annotations")
-
-        ocr_words = json.loads(ocr_row["words"])
-        ts_words  = json.loads(ts_row["words"])
-        if not ts_words:
-            raise HTTPException(status_code=400, detail="No timestamp words found — re-run Timestamps")
-
-        # Fetch chunk text from script_chunks
-        chunk_text = ""
-        res = (get_supabase().table("script_chunks").select("content")
-               .eq("id", req.chunk_id).limit(1).execute())
-        if res.data:
-            chunk_text = res.data[0].get("content", "")
-
-        annotations = generate_annotations(ocr_words, ts_words, chunk_text, req.chunk_number)
-        _upsert_ai(req.script_id, req.chunk_id, req.chunk_number, req.slide_source, annotations)
-        return {"ok": True, "annotation_count": len(annotations)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[AI/run] ERROR chunk {req.chunk_number}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def _ai_all_job(script_id: str, slide_source: str) -> None:
-    chunks = _get_chunks(script_id)
-    print(f"[AI/run-all] processing {len(chunks)} chunks")
-    for chunk in chunks:
-        try:
-            chunk_id     = chunk["id"]
-            chunk_number = chunk["chunk_index"]
-            ocr_row = _get_ocr(chunk_id, slide_source)
-            ts_row  = _get_ts(chunk_id)
-            if not ocr_row or not ts_row:
-                print(f"[AI/run-all] chunk {chunk_number} skipped — missing OCR or TS")
-                continue
-            ocr_words  = json.loads(ocr_row["words"])
-            ts_words   = json.loads(ts_row["words"])
-            if not ts_words:
-                continue
-            chunk_text = chunk.get("content", "")
-            annotations = generate_annotations(ocr_words, ts_words, chunk_text, chunk_number)
-            _upsert_ai(script_id, chunk_id, chunk_number, slide_source, annotations)
-            print(f"[AI/run-all] chunk {chunk_number} done — {len(annotations)} annotations")
-        except Exception as e:
-            print(f"[AI/run-all] chunk {chunk.get('chunk_index')} FAILED: {e}")
-
-@app.post("/ai/run-all")
-def ai_run_all(req: AiRunAllReq, bg: BackgroundTasks):
-    try:
-        chunks = _get_chunks(req.script_id)
-        bg.add_task(_ai_all_job, req.script_id, req.slide_source)
-        return {"ok": True, "queued": len(chunks)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -367,17 +280,22 @@ def ai_run_all(req: AiRunAllReq, bg: BackgroundTasks):
 def _render_job(script_id: str, chunk_id: str, chunk_number: int, slide_source: str) -> None:
     tmp_slide = tmp_audio = tmp_out = None
     try:
-        print(f"[RENDER] start chunk {chunk_number} ({chunk_id})")
+        print(f"[RENDER] start chunk {chunk_number} ({chunk_id})", flush=True)
 
-        ai_row = _get_ai(chunk_id, slide_source)
+        # Fetch annotations from DB (now generated by Supabase Edge Function)
+        res = (get_supabase().table("clip_annotations").select("annotations")
+               .eq("chunk_id", chunk_id).eq("slide_source", slide_source)
+               .limit(1).execute())
+        ai_row = res.data[0] if res.data else None
         if not ai_row:
-            raise ValueError("Annotations not found — run AI step first")
+            raise ValueError("Annotations not found in DB — run AI step first")
 
         tmp_slide = download_to_tmp(SLIDES_BUCKET, slide_path(script_id, chunk_number), ".png")
         tmp_audio = download_to_tmp(AUDIO_BUCKET, audio_path(script_id, chunk_number), ".mp3")
 
         tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir="/tmp/render").name
-        annotations = json.loads(ai_row["annotations"])
+        raw = ai_row["annotations"]
+        annotations = raw if isinstance(raw, list) else json.loads(raw)
 
         duration = render_clip(tmp_slide, tmp_audio, annotations, tmp_out)
 
@@ -392,10 +310,10 @@ def _render_job(script_id: str, chunk_id: str, chunk_number: int, slide_source: 
             duration=duration,
             error_msg=None,
         )
-        print(f"[RENDER] chunk {chunk_number} done — {duration:.2f}s → {file_url}")
+        print(f"[RENDER] chunk {chunk_number} done — {duration:.2f}s → {file_url}", flush=True)
 
     except Exception as e:
-        print(f"[RENDER] chunk {chunk_number} ERROR: {e}")
+        print(f"[RENDER] chunk {chunk_number} ERROR: {e}", flush=True)
         _update_clip_status(script_id, chunk_id, slide_source,
                             status="error", error_msg=str(e)[:500])
     finally:
@@ -405,7 +323,10 @@ def _render_job(script_id: str, chunk_id: str, chunk_number: int, slide_source: 
 @app.post("/clips/render")
 def clips_render(req: RenderReq, bg: BackgroundTasks):
     try:
-        ai_row = _get_ai(req.chunk_id, req.slide_source)
+        res = (get_supabase().table("clip_annotations").select("annotations")
+               .eq("chunk_id", req.chunk_id).eq("slide_source", req.slide_source)
+               .limit(1).execute())
+        ai_row = res.data[0] if res.data else None
         if not ai_row:
             raise HTTPException(status_code=400, detail="Annotations not generated yet — run AI step first")
 
@@ -424,9 +345,12 @@ def _render_all_job(script_id: str, slide_source: str) -> None:
     for chunk in chunks:
         chunk_id     = chunk["id"]
         chunk_number = chunk["chunk_index"]
-        ai_row = _get_ai(chunk_id, slide_source)
+        res = (get_supabase().table("clip_annotations").select("annotations")
+               .eq("chunk_id", chunk_id).eq("slide_source", slide_source)
+               .limit(1).execute())
+        ai_row = res.data[0] if res.data else None
         if not ai_row:
-            print(f"[RENDER/all] chunk {chunk_number} skipped — no annotations")
+            print(f"[RENDER/all] chunk {chunk_number} skipped — no annotations", flush=True)
             continue
         _upsert_clip(script_id, chunk_id, chunk_number, slide_source, status="rendering")
         _render_job(script_id, chunk_id, chunk_number, slide_source)
@@ -499,3 +423,34 @@ async def stream_clip(filename: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MERGE ROUTES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _merge_job(script_id: str, slide_source: str) -> None:
+    try:
+        merge_script_clips(script_id, slide_source)
+    except Exception as e:
+        print(f"[MERGE/job] Background task failed: {e}")
+
+@app.post("/merge/run")
+def merge_run(req: MergeReq, bg: BackgroundTasks):
+    try:
+        # Check if we have any clips first
+        res = (get_supabase().table("video_clips").select("id")
+               .eq("script_id", req.script_id)
+               .eq("slide_source", req.slide_source)
+               .eq("status", "done")
+               .limit(1).execute())
+        if not res.data:
+            raise HTTPException(status_code=400, detail="No rendered clips found. Render chunks first.")
+
+        bg.add_task(_merge_job, req.script_id, req.slide_source)
+        return {"ok": True, "status": "queued"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
