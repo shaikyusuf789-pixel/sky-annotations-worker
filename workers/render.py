@@ -24,6 +24,7 @@ from PIL import Image
 W, H, FPS = 1280, 720, 24
 
 STROKE_COLORS = {
+    "pen":              "#ffffff",
     "underline":         "#ffffff",
     "double_underline":  "#ffffff",
     "circle":            "#ffffff",
@@ -33,6 +34,7 @@ STROKE_COLORS = {
 
 # Base drawing durations
 DRAW_SECONDS = {
+    "pen":               0.9,
     "underline":         1.2,
     "double_underline":  1.6,
     "circle":            1.8,
@@ -127,6 +129,16 @@ def _circle_pts(cx, cy, rx, ry):
     return _add_human_jitter(pts, intensity=2.0)
 
 
+
+def _pen_pts(x, y_mid, w):
+    """White pen stroke through the vertical centre of the bbox — slight wobble."""
+    steps = max(20, w // 3)
+    wobble = [0, 1, 2, 1, 0, -1, -2, -1]
+    return [
+        (x + w * i // steps, y_mid + wobble[i % len(wobble)])
+        for i in range(steps + 1)
+    ]
+
 def _box_pts(x, y, w, h):
     n = 20
     def side(x1, y1, x2, y2):
@@ -182,6 +194,8 @@ def _build_frame_svg(annotations, progress_map, src_w, src_h, default_color="#ff
             add(_circle_pts(x + w / 2, y + h / 2, w / 2 + 14, h / 2 + 12))
         elif ann_type == "box":
             add(_box_pts(x - 6, y - 4, w + 12, h + 8))
+        elif ann_type == "pen":
+            add(_pen_pts(x, y + h // 2, w), "5")
         elif ann_type == "arrow":
             add(_arrow_pts(x, y + h // 2))
 
