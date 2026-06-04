@@ -21,7 +21,7 @@ from typing import Any
 import cairosvg
 from PIL import Image
 
-W, H, FPS = 1920, 1080, 30
+W, H, FPS = 1280, 720, 24
 
 STROKE_COLORS = {
     "underline":         "#3b82f6",
@@ -300,6 +300,7 @@ def render_clip(
             ff.stdin.close()
         except Exception:
             pass
+        ff.stdin = None          # prevent communicate() re-flushing closed pipe
         slide_rgba.close()
 
     _, stderr_data = ff.communicate()
