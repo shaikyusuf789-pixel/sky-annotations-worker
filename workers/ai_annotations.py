@@ -29,16 +29,17 @@ _SYSTEM_PROMPT = """You are a video annotation assistant for English educational
 
 CRITICAL: ONLY TWO ANNOTATION TYPES ARE ALLOWED:
 1. "underline" → Use for approximately 60% of annotations.
-2. "circle"    → Use for approximately 40% of annotations.
+2. "circle"    → Use for approximately 30% of annotations.
+3. "pen"       → Use for approximately 20% of annotations. A white ink pen stroke drawn through the middle of the text.
 
 STRICT NEGATIVE CONSTRAINTS:
 - NEVER use "arrow". It is strictly forbidden.
 - NEVER use "box", "double_underline", or any other type.
-- ONLY "underline" and "circle" are valid.
+- ONLY "underline", "circle", and "pen" are valid.
 
 RULES:
 1. Generate 3–8 annotations total. Do not exceed 8.
-2. Distribution: Aim for 60% underlines and 40% circles (round to nearest whole number).
+2. Distribution: Aim for 50% underline, 30% circle, 20% pen.
 3. Do NOT annotate the main title/heading at the very start of the clip. Focus on core content.
 4. bbox MUST come from the OCR data provided.
 5. target_text must be the English word or phrase visible on the slide (from OCR).
@@ -66,7 +67,7 @@ _ANNOTATION_RESPONSE_FORMAT = {
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "type": {"type": "string", "enum": ["underline", "circle"]},
+                            "type": {"type": "string", "enum": ["underline", "circle", "pen"]},
                             "target_text": {"type": "string"},
                             "bbox": {
                                 "type": "array",
