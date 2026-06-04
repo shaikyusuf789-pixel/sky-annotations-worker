@@ -31,6 +31,7 @@ STROKE_COLORS = {
     "arrow":             "#8b5cf6",
 }
 
+# Base drawing durations
 DRAW_SECONDS = {
     "underline":         1.2,
     "double_underline":  1.6,
@@ -38,6 +39,26 @@ DRAW_SECONDS = {
     "box":               2.0,
     "arrow":             1.2,
 }
+
+import random
+
+def _add_human_jitter(pts: list[tuple[int, int]], intensity: float = 1.5) -> list[tuple[int, int]]:
+    """Adds small random offsets to mimic shaky human hand."""
+    if not pts: return pts
+    return [
+        (round(x + random.uniform(-intensity, intensity)), 
+         round(y + random.uniform(-intensity, intensity)))
+        for x, y in pts
+    ]
+
+def _get_image_brightness(img: Image.Image) -> str:
+    """Returns 'light' or 'dark' based on perceived brightness."""
+    # Convert to grayscale and get average
+    grayscale = img.convert("L")
+    stat = grayscale.getdata()
+    avg = sum(stat) / len(stat)
+    return "dark" if avg < 128 else "light"
+
 
 # Quantize per-annotation progress to this many steps so frames with
 # the same visual state can be cached and reused.
@@ -83,54 +104,66 @@ def _pts_to_path(pts: list[tuple[int, int]]) -> str:
 
 def _underline_pts(x, y_bottom, w):
     steps = max(20, w // 4)
-    return [(x + w * i // steps, y_bottom + 4) for i in range(steps + 1)]
+    pts = [(x + w * i // steps, y_bottom + 4) for i in range(steps + 1)]
+    return _add_human_jitter(pts)
 
 
 def _double_underline_pts(x, y_bottom, w):
     steps = max(20, w // 4)
-    return [
-        [(x + w * i // steps, y_bottom + 4) for i in range(steps + 1)],
-        [(x + w * i // steps, y_bottom + 11) for i in range(steps + 1)],
-    ]
+    line1 = [(x + w * i // steps, y_bottom + 4) for i in range(steps + 1)]
+    line2 = [(x + w * i // steps, y_bottom + 11) for i in range(steps + 1)]
+    return [_add_human_jitter(line1), _add_human_jitter(line2)]
 
 
 def _circle_pts(cx, cy, rx, ry):
-    return [
-        (
-            round(cx + rx * math.cos(-math.pi / 2 - 2.1 * math.pi * i / 89)),
-            round(cy + ry * math.sin(-math.pi / 2 - 2.1 * math.pi * i / 89)),
-        )
-        for i in range(90)
-    ]
+    # Humans don't draw perfect circles; start/end mismatch slightly
+    pts = []
+    # 95 steps to overdraw slightly
+    for i in range(95):
+        angle = -math.pi / 2 - (2.05 * math.pi * i / 89)
+        px = cx + rx * math.cos(angle)
+        py = cy + ry * math.sin(angle)
+        pts.append((round(px), round(py)))
+    return _add_human_jitter(pts, intensity=2.0)
 
 
 def _box_pts(x, y, w, h):
     n = 20
     def side(x1, y1, x2, y2):
         return [(x1 + (x2 - x1) * i // n, y1 + (y2 - y1) * i // n) for i in range(n)]
-    return (side(x, y, x+w, y) + side(x+w, y, x+w, y+h)
-            + side(x+w, y+h, x, y+h) + side(x, y+h, x, y) + [(x, y)])
+    
+    # Human box: corners don't always meet perfectly
+    pts = (side(x, y, x+w, y) + side(x+w, y, x+w, y+h)
+            + side(x+w, y+h, x, y+h) + side(x, y+h, x, y))
+    # Close it imperfectly
+    pts.append((x + random.randint(-3, 3), y + random.randint(-3, 3)))
+    return _add_human_jitter(pts)
 
 
 def _arrow_pts(x, y_mid):
     tip = x - 10
-    return (
-        [(tip - 40 + i * 2, y_mid) for i in range(20)]
-        + [(tip - i * 8, y_mid - i * 8) for i in range(5)]
-        + [(tip - 40 + i * 8, y_mid - 40 + i * 8) for i in range(5)]
-    )
+    stem = [(tip - 40 + i * 2, y_mid) for i in range(20)]
+    head1 = [(tip - i * 8, y_mid - i * 8) for i in range(5)]
+    head2 = [(tip - 40 + i * 8, y_mid - 40 + i * 8) for i in range(5)]
+    return _add_human_jitter(stem + head1 + head2)
+
 
 
 # ── SVG frame builder ────────────────────────────────────────────────────────
 
-def _build_frame_svg(annotations, progress_map, src_w, src_h) -> str:
+def _build_frame_svg(annotations, progress_map, src_w, src_h, default_color="#ffffff") -> str:
     paths_svg = []
     for idx, ann in enumerate(annotations):
         prog = progress_map.get(idx)
         if prog is None or prog <= 0:
             continue
         ann_type = ann["type"]
-        color = STROKE_COLORS.get(ann_type, "#ffffff")
+        # Use detection-based default color, but keep branded types if preferred 
+        # (Though black/white is safer for contrast)
+        color = STROKE_COLORS.get(ann_type, default_color)
+        if default_color == "#000000" and color == "#ffffff": # Safety for light mode
+             color = "#000000"
+
         sw = "8" if ann_type in ("circle", "box") else "6"
         x, y, w, h = _scale_bbox(ann["bbox"], src_w, src_h)
 
@@ -207,12 +240,41 @@ def render_clip(
         raw_slide.close()
     slide_rgba = bg
     slide_bytes = slide_rgba.tobytes()
+    
+    # Detect brightness for pen color
+    brightness = _get_image_brightness(slide_rgba)
+    default_pen_color = "#ffffff" if brightness == "dark" else "#000000"
+    print(f"[RENDER] slide brightness: {brightness}, using {default_pen_color} pen", flush=True)
 
-    draw_durations = [
-        max(0.5, float(ann.get("draw_duration") or DRAW_SECONDS.get(ann["type"], 1.5)))
-        for ann in annotations
-    ]
-    start_times = [float(ann.get("start_time") or 0) for ann in annotations]
+    # Calculate durations and ENFORCE SEQUENTIAL (One hand rule)
+    draw_durations = []
+    start_times = []
+    
+    last_end_time = 0.0
+    # Sort annotations by their intended start time to ensure we process them in order
+    sorted_anns = sorted(enumerate(annotations), key=lambda x: float(x[1].get("start_time") or 0))
+    
+    # We'll store the adjusted start times in a map linked to original index
+    adjusted_starts = {}
+    
+    for orig_idx, ann in sorted_anns:
+        orig_start = float(ann.get("start_time") or 0)
+        dur = max(0.5, float(ann.get("draw_duration") or DRAW_SECONDS.get(ann["type"], 1.5)))
+        
+        # If this starts before the previous one finished, push it forward
+        if orig_start < last_end_time:
+            new_start = last_end_time + 0.1 # 0.1s gap between strokes
+        else:
+            new_start = orig_start
+            
+        adjusted_starts[orig_idx] = new_start
+        draw_durations.append(dur) # These will be used by index i below, so order matters
+        last_end_time = new_start + dur
+
+    # Re-align start_times list to match original annotation order for the frame loop
+    start_times = [adjusted_starts[i] for i in range(len(annotations))]
+    draw_durations = [max(0.5, float(ann.get("draw_duration") or DRAW_SECONDS.get(ann["type"], 1.5))) for ann in annotations]
+
 
     # Start ffmpeg
     ff = subprocess.Popen(
@@ -270,7 +332,7 @@ def render_clip(
                 ff.stdin.write(cached)
                 continue
 
-            svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h)
+            svg = _build_frame_svg(annotations, prog_map, ocr_src_w, ocr_src_h, default_pen_color)
             if not svg:
                 frame_bytes = slide_bytes
             else:
