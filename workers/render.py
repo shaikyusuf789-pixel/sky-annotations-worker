@@ -300,7 +300,7 @@ def render_clip(
             ff.stdin.close()
         except Exception:
             pass
-        ff.stdin = None          # prevent communicate() re-flushing closed pipe
+        ff.stdin = None          # ← keep this line — prevents communicate() re-flushing closed pipe
         slide_rgba.close()
 
     _, stderr_data = ff.communicate()

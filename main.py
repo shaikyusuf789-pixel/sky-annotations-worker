@@ -343,7 +343,7 @@ def _render_all_job(script_id: str, slide_source: str) -> None:
                .limit(1).execute())
         ai_row = res.data[0] if res.data else None
         if not ai_row:
-            print(f"[RENDER/all] chunk {chunk_number} skipped — no annotations")
+            print(f"[RENDER/all] chunk {chunk_number} skipped — no annotations", flush=True)
             continue
         _upsert_clip(script_id, chunk_id, chunk_number, slide_source, status="rendering")
         _render_job(script_id, chunk_id, chunk_number, slide_source)
