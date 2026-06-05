@@ -181,8 +181,8 @@ def _build_frame_svg(annotations, all_ann_pts, progress_map) -> str:
         # User requested white pen always
         color = "#ffffff"
 
-        # Reduced stroke width to 70% of previous (8->5.6, 6->4.2)
-        sw = "5.6" if ann_type in ("circle", "box") else "4.2"
+        # Reduced stroke width to 50% of previous (8->2.8, 6->2.1)
+        sw = "2.8" if ann_type in ("circle", "box") else "2.1"
         
         pts_data = all_ann_pts[idx]
         if not pts_data:
@@ -199,9 +199,9 @@ def _build_frame_svg(annotations, all_ann_pts, progress_map) -> str:
         if ann_type == "double_underline":
             # pts_data is a list of two lines
             for line in pts_data:
-                add(line, "4.2")
+                add(line, "2.1")
         elif ann_type == "pen":
-            add(pts_data, "3.5") # 5 * 0.7 = 3.5
+            add(pts_data, "1.75") # 3.5 * 0.5 = 1.75
         else:
             add(pts_data)
 
