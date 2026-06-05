@@ -31,7 +31,7 @@ from lib.supabase_client import get_supabase
 from lib.storage import (
     SLIDES_BUCKET, AUDIO_BUCKET, VIDEO_CLIPS_BUCKET,
     slide_path, audio_path, clip_storage_path,
-    download_to_tmp, upload_clip, cleanup,
+    download_to_tmp, download_audio_to_tmp, upload_clip, cleanup,
 )
 from workers.ocr import run_ocr
 from workers.timestamps import get_timestamps
@@ -233,7 +233,7 @@ def timestamps_run(req: TsRunReq):
     tmp = None
     try:
         print(f"[TS/run] chunk {req.chunk_number} ({req.chunk_id})")
-        tmp = download_to_tmp(AUDIO_BUCKET, audio_path(req.script_id, req.chunk_number), ".mp3")
+        tmp = download_audio_to_tmp(req.script_id, req.chunk_number)
         words, duration = get_timestamps(tmp)
         _upsert_timestamps(req.script_id, req.chunk_id, req.chunk_number, words)
         return {"ok": True, "word_count": len(words), "duration": duration}
@@ -252,7 +252,7 @@ def _ts_all_job(script_id: str) -> None:
         try:
             chunk_id     = chunk["id"]
             chunk_number = chunk["chunk_index"]
-            tmp = download_to_tmp(AUDIO_BUCKET, audio_path(script_id, chunk_number), ".mp3")
+            tmp = download_audio_to_tmp(script_id, chunk_number)
             words, _ = get_timestamps(tmp)
             _upsert_timestamps(script_id, chunk_id, chunk_number, words)
             print(f"[TS/run-all] chunk {chunk_number} done — {len(words)} words")
@@ -291,7 +291,7 @@ def _render_job(script_id: str, chunk_id: str, chunk_number: int, slide_source: 
             raise ValueError("Annotations not found in DB — run AI step first")
 
         tmp_slide = download_to_tmp(SLIDES_BUCKET, slide_path(script_id, chunk_number), ".png")
-        tmp_audio = download_to_tmp(AUDIO_BUCKET, audio_path(script_id, chunk_number), ".mp3")
+        tmp_audio = download_audio_to_tmp(script_id, chunk_number)
 
         tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir="/tmp/render").name
         raw = ai_row["annotations"]
