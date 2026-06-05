@@ -48,25 +48,10 @@ def slide_path(script_id: str, chunk_number: int) -> str:
 
 
 
-def audio_path(script_id: str, chunk_number: int, ext: str = "mp3") -> str:
+def audio_path(script_id: str, chunk_number: int) -> str:
     # Match the generate-audio edge function: 1-indexed, zero-padded to 3 digits
     audio_number = str(chunk_number + 1).zfill(3)
-    return f"{script_id}/audio_{audio_number}.{ext}"
-
-
-def download_audio_to_tmp(script_id: str, chunk_number: int) -> str:
-    """
-    Download a chunk's audio, trying .mp3 (ElevenLabs) then .wav (Cartesia).
-    """
-    last_err = None
-    for ext in ("mp3", "wav"):
-        path = audio_path(script_id, chunk_number, ext)
-        try:
-            return download_to_tmp(AUDIO_BUCKET, path, f".{ext}")
-        except FileNotFoundError as e:
-            last_err = e
-            continue
-    raise FileNotFoundError(f"No audio file found for {script_id} chunk {chunk_number} (.mp3/.wav)") from last_err
+    return f"{script_id}/audio_{audio_number}.mp3"
 
 
 
