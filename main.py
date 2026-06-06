@@ -36,6 +36,7 @@ from workers.ocr import run_ocr
 from workers.timestamps import get_timestamps
 from workers.render import render_clip, get_audio_duration
 from workers.merger import merge_script_clips
+from workers.editor import apply_cuts as editor_apply_cuts, _meta_key as editor_meta_key
 
 import httpx
 
@@ -441,5 +442,61 @@ async def stream_clip(filename: str):
         return StreamingResponse(_stream(), media_type="video/mp4")
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EDITOR ROUTES (apply user cuts → overwrite original video in storage)
+# Isolated from OCR / timestamps / render / merge — does not touch their tables.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EditorApplyCutsReq(BaseModel):
+    script_id:    str
+    slide_source: str = "gamma"
+    bucket:       str = "video-clips"
+    path:         str            # e.g. "{script_id}/mega_gamma.mp4"
+    cuts:         list[list[float]]  # [[start_sec, end_sec], ...] ranges to REMOVE
+
+
+def _editor_job(script_id: str, slide_source: str, bucket: str, path: str,
+                cuts: list[list[float]]) -> None:
+    try:
+        editor_apply_cuts(script_id, slide_source, bucket, path, cuts)
+    except Exception as e:
+        print(f"[EDITOR] background job ERROR: {e}")
+
+
+@app.post("/editor/apply-cuts")
+def editor_apply_cuts_route(req: EditorApplyCutsReq, bg: BackgroundTasks):
+    try:
+        key = editor_meta_key(req.script_id, req.slide_source)
+        get_supabase().table("app_metadata").upsert({
+            "key":   key,
+            "value": {
+                "status": "queued",
+                "bucket": req.bucket,
+                "path":   req.path,
+                "slide_source": req.slide_source,
+                "error":  None,
+                "url":    None,
+            },
+        }, on_conflict="key").execute()
+        bg.add_task(_editor_job, req.script_id, req.slide_source,
+                    req.bucket, req.path, req.cuts)
+        return {"ok": True, "status": "queued", "key": key}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/editor/status")
+def editor_status(script_id: str = Query(...), slide_source: str = Query("gamma")):
+    try:
+        key = editor_meta_key(script_id, slide_source)
+        res = (get_supabase().table("app_metadata").select("value")
+               .eq("key", key).limit(1).execute())
+        if not res.data:
+            return {"ok": True, "status": "unknown", "value": None}
+        return {"ok": True, "value": res.data[0]["value"]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
