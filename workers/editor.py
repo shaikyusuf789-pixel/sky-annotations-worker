@@ -232,3 +232,86 @@ def apply_cuts(
         raise
     finally:
         cleanup(tmp_in, tmp_out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPORT — re-encode current video at a chosen quality preset and upload to
+# a temp path under the same bucket. Returns a public URL the browser can
+# download. Does NOT overwrite the original.
+# ══════════════════════════════════════════════════════════════════════════════
+
+import time
+
+QUALITY_PRESETS = {
+    "low":    {"vbitrate": "600k",  "abitrate": "96k",  "scale": "iw*0.6:ih*0.6", "preset": "veryfast", "crf": "30"},
+    "medium": {"vbitrate": "1800k", "abitrate": "128k", "scale": "iw:ih",         "preset": "veryfast", "crf": "24"},
+    "high":   {"vbitrate": "4500k", "abitrate": "192k", "scale": "iw:ih",         "preset": "medium",   "crf": "20"},
+}
+
+
+def _export_meta_key(script_id: str, slide_source: str) -> str:
+    return f"editor_export:{script_id}:{slide_source}"
+
+
+def _update_export_meta(script_id: str, slide_source: str, **fields) -> None:
+    sb = get_supabase()
+    key = _export_meta_key(script_id, slide_source)
+    try:
+        res = sb.table("app_metadata").select("value").eq("key", key).limit(1).execute()
+        current = (res.data[0]["value"] if res.data else {}) or {}
+    except Exception:
+        current = {}
+    current.update(fields)
+    sb.table("app_metadata").upsert({"key": key, "value": current}, on_conflict="key").execute()
+
+
+def export_video(script_id: str, slide_source: str, bucket: str, path: str, quality: str) -> dict:
+    """Download the current video at bucket/path, transcode at the quality preset,
+    upload to bucket/exports/{script_id}/{slide_source}_{quality}_{ts}.mp4, return URL."""
+    if quality not in QUALITY_PRESETS:
+        raise ValueError(f"Unknown quality '{quality}'")
+    preset = QUALITY_PRESETS[quality]
+    tmp_in = tmp_out = None
+    try:
+        print(f"[EDITOR/EXPORT] script={script_id} q={quality} src={bucket}/{path}")
+        _update_export_meta(script_id, slide_source, status="running", quality=quality,
+                            error=None, url=None, size_bytes=None)
+        tmp_in = _download_storage(bucket, path, ".mp4")
+        tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", tmp_in,
+            "-vf", f"scale={preset['scale']}",
+            "-c:v", "libx264", "-preset", preset["preset"], "-crf", preset["crf"],
+            "-b:v", preset["vbitrate"], "-maxrate", preset["vbitrate"], "-bufsize", preset["vbitrate"],
+            "-c:a", "aac", "-b:a", preset["abitrate"],
+            "-movflags", "+faststart",
+            tmp_out,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = "\n".join(proc.stderr.splitlines()[-25:])
+            raise RuntimeError(f"ffmpeg failed: {tail}")
+
+        size_bytes = os.path.getsize(tmp_out)
+        ts = int(time.time())
+        export_path = f"exports/{script_id}/{slide_source}_{quality}_{ts}.mp4"
+        sb = get_supabase()
+        with open(tmp_out, "rb") as f:
+            data = f.read()
+        sb.storage.from_(bucket).upload(export_path, data,
+                                        {"content-type": "video/mp4", "upsert": "true"})
+        url = f"{config.SUPABASE_URL}/storage/v1/object/public/{bucket}/{export_path}"
+        _update_export_meta(script_id, slide_source, status="done", quality=quality,
+                            url=url, size_bytes=size_bytes, error=None,
+                            export_path=export_path)
+        print(f"[EDITOR/EXPORT] done {quality} {size_bytes//1024} KB → {url}")
+        return {"ok": True, "url": url, "size_bytes": size_bytes, "quality": quality}
+
+    except Exception as e:
+        print(f"[EDITOR/EXPORT] ERROR: {e}")
+        _update_export_meta(script_id, slide_source, status="error", error=str(e)[:500])
+        raise
+    finally:
+        cleanup(tmp_in, tmp_out)
