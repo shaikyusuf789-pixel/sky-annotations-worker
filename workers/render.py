@@ -239,6 +239,26 @@ def render_clip(
 ) -> float:
     audio_dur = get_audio_duration(audio_path)
     total_frames = math.ceil(audio_dur * FPS)
+
+    # Filter out malformed annotations (missing bbox/type) so one bad row
+    # does not crash the whole clip. Log + skip instead.
+    _orig_count = len(annotations)
+    cleaned: list[dict[str, Any]] = []
+    for i, ann in enumerate(annotations or []):
+        if not isinstance(ann, dict):
+            print(f"[RENDER] skip ann[{i}]: not a dict ({type(ann).__name__})", flush=True)
+            continue
+        if "bbox" not in ann or ann.get("bbox") is None:
+            print(f"[RENDER] skip ann[{i}] type={ann.get('type')!r}: missing bbox", flush=True)
+            continue
+        if not ann.get("type"):
+            print(f"[RENDER] skip ann[{i}]: missing type", flush=True)
+            continue
+        cleaned.append(ann)
+    annotations = cleaned
+    if len(annotations) != _orig_count:
+        print(f"[RENDER] dropped {_orig_count - len(annotations)} malformed annotations", flush=True)
+
     print(f"[RENDER] {total_frames} frames @ {FPS}fps, dur={audio_dur:.2f}s, anns={len(annotations)}", flush=True)
 
     # Load + letterbox slide once
